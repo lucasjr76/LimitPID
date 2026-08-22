@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Mark do LimitPID: seta para baixo (download) + seta para cima (upload).
+       Desenhado para 22px na bandeja: sem texto, sem selo, sem brilho, traco
+       grosso e margem de 4 unidades. O logo completo (limitpid.png) continua
+       para os tamanhos grandes. -->
+  <polygon fill="#3b9dff" points="11,8 23,8 23,34 30,34 17,56 4,34 11,34"/>
+  <polygon fill="#2fd18a" points="47,8 60,30 53,30 53,56 41,56 41,30 34,30"/>
+</svg>

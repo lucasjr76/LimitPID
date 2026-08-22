@@ -1,0 +1,1470 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+###############################################################################
+# limitpid
+#
+# Limitador de banda por PID usando:
+#
+#       cgroup v2 + eBPF BPF_PROG_TYPE_CGROUP_SKB
+#
+# NÃO usa:
+#       tc
+#       iptables
+#       nftables
+#
+# Uso:
+#
+#   limitpid apply PID DOWNLOAD UPLOAD
+#   limitpid status PID
+#   limitpid remove PID
+#
+# Exemplos:
+#
+#   limitpid apply 12345 10M 2M
+#   limitpid status 12345
+#   limitpid remove 12345
+#
+# Unidades:
+#   100K = 100 kbit/s
+#   10M  = 10 Mbit/s
+#   1G   = 1 Gbit/s
+#
+###############################################################################
+
+VERSION="0.1"
+
+CGROOT="/sys/fs/cgroup"
+BPFROOT="/sys/fs/bpf"
+
+RUNROOT="/run/limitpid"
+LIBROOT="/usr/local/libexec/limitpid"
+
+LOADER="$LIBROOT/limitpid-loader"
+LOADER_SRC="$RUNROOT/limitpid-loader.c"
+
+mkdir -p "$RUNROOT"
+mkdir -p "$LIBROOT"
+
+###############################################################################
+# CORES
+###############################################################################
+
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    BOLD=""
+    RESET=""
+fi
+
+die()
+{
+    echo "${RED}ERRO:${RESET} $*" >&2
+    exit 1
+}
+
+info()
+{
+    echo "${BLUE}==>${RESET} $*"
+}
+
+ok()
+{
+    echo "${GREEN}OK:${RESET} $*"
+}
+
+warn()
+{
+    echo "${YELLOW}AVISO:${RESET} $*" >&2
+}
+
+###############################################################################
+# ROOT
+###############################################################################
+
+need_root()
+{
+    if [[ $EUID -ne 0 ]]; then
+        die "execute como root: sudo $0 $*"
+    fi
+}
+
+###############################################################################
+# RATE
+###############################################################################
+
+parse_rate()
+{
+    local v="${1^^}"
+    local n
+
+    case "$v" in
+        *K)
+            n="${v%K}"
+            [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000))
+            ;;
+
+        *M)
+            n="${v%M}"
+            [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000 * 1000))
+            ;;
+
+        *G)
+            n="${v%G}"
+            [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000 * 1000 * 1000))
+            ;;
+
+        *)
+            [[ "$v" =~ ^[0-9]+$ ]] || return 1
+            echo "$v"
+            ;;
+    esac
+}
+
+###############################################################################
+# /proc helpers
+###############################################################################
+
+get_ppid()
+{
+    local pid="$1"
+
+    [[ -r "/proc/$pid/status" ]] || return 1
+
+    awk '
+        /^PPid:/ {
+            print $2
+            exit
+        }
+    ' "/proc/$pid/status"
+}
+
+get_starttime()
+{
+    local pid="$1"
+    local stat rest
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+
+    stat=$(<"/proc/$pid/stat")
+
+    #
+    # Remove:
+    #
+    #   PID (COMMAND)
+    #
+    # O restante começa pelo campo 3 do /proc/PID/stat.
+    #
+
+    rest="${stat##*) }"
+
+    set -- $rest
+
+    #
+    # starttime é campo 22 no stat.
+    # Como removemos os campos 1 e 2, vira posição 20.
+    #
+
+    echo "${20}"
+}
+
+get_cgroup()
+{
+    local pid="$1"
+
+    [[ -r "/proc/$pid/cgroup" ]] || return 1
+
+    awk -F: '
+        $1 == "0" {
+            print $3
+            exit
+        }
+    ' "/proc/$pid/cgroup"
+}
+
+get_comm()
+{
+    local pid="$1"
+
+    if [[ -r "/proc/$pid/comm" ]]; then
+        tr -d '\n' < "/proc/$pid/comm"
+    else
+        echo "?"
+    fi
+}
+
+###############################################################################
+# Verificações
+###############################################################################
+
+check_environment()
+{
+    local fstype
+
+    [[ -d "$CGROOT" ]] || die "$CGROOT não existe"
+
+    fstype=$(stat -fc %T "$CGROOT" 2>/dev/null || true)
+
+    [[ "$fstype" == "cgroup2fs" ]] ||
+        die "cgroup v2 não está ativo. Encontrado: $fstype"
+
+    grep -qw cgroup_bpf /proc/kallsyms 2>/dev/null || true
+
+    mkdir -p "$BPFROOT"
+
+    if ! grep -qsE '[[:space:]]/sys/fs/bpf[[:space:]]+bpf[[:space:]]' /proc/mounts; then
+        info "Montando bpffs em $BPFROOT"
+        mount -t bpf bpf "$BPFROOT" ||
+            die "não consegui montar bpffs"
+    fi
+
+    mkdir -p "$BPFROOT/limitpid"
+    mkdir -p "$CGROOT/limitpid"
+}
+
+###############################################################################
+# Loader libbpf
+###############################################################################
+
+build_loader()
+{
+    [[ -x "$LOADER" ]] && return 0
+
+    command -v gcc >/dev/null 2>&1 ||
+        die "gcc não encontrado"
+
+    command -v pkg-config >/dev/null 2>&1 ||
+        die "pkg-config não encontrado"
+
+    pkg-config --exists libbpf ||
+        die "libbpf-dev/libbpf-devel não está instalado"
+
+    info "Compilando loader eBPF..."
+
+    cat > "$LOADER_SRC" <<'EOF'
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+
+struct bucket_state {
+    uint32_t lock;
+    uint32_t pad;
+
+    uint64_t last_ns;
+    uint64_t tokens;
+
+    uint64_t allowed_bytes;
+    uint64_t dropped_bytes;
+
+    uint64_t allowed_packets;
+    uint64_t dropped_packets;
+};
+
+static void human_bytes(uint64_t n, char *buf, size_t sz)
+{
+    const char *u[] = {
+        "B", "KB", "MB", "GB", "TB"
+    };
+
+    double v = n;
+    int i = 0;
+
+    while (v >= 1000.0 && i < 4) {
+        v /= 1000.0;
+        i++;
+    }
+
+    snprintf(buf, sz, "%.2f %s", v, u[i]);
+}
+
+static int show_stats(const char *map_path)
+{
+    int fd;
+    uint32_t key;
+    struct bucket_state v;
+
+    fd = bpf_obj_get(map_path);
+
+    if (fd < 0) {
+        fprintf(stderr,
+                "bpf_obj_get(%s): %s\n",
+                map_path,
+                strerror(errno));
+        return 1;
+    }
+
+    for (key = 0; key < 2; key++) {
+
+        memset(&v, 0, sizeof(v));
+
+        if (bpf_map_lookup_elem(fd, &key, &v) != 0) {
+            fprintf(stderr,
+                    "bpf_map_lookup_elem: %s\n",
+                    strerror(errno));
+            close(fd);
+            return 1;
+        }
+
+        char allow[64];
+        char drop[64];
+
+        human_bytes(v.allowed_bytes, allow, sizeof(allow));
+        human_bytes(v.dropped_bytes, drop, sizeof(drop));
+
+        printf("%s:\n",
+               key == 0 ? "DOWNLOAD" : "UPLOAD");
+
+        printf("  permitido : %-14s (%llu pacotes)\n",
+               allow,
+               (unsigned long long)v.allowed_packets);
+
+        printf("  descartado: %-14s (%llu pacotes)\n",
+               drop,
+               (unsigned long long)v.dropped_packets);
+    }
+
+    close(fd);
+
+    return 0;
+}
+
+static int load_program(
+        const char *objfile,
+        const char *cgpath,
+        const char *pindir)
+{
+    struct bpf_object *obj = NULL;
+    struct bpf_program *pin = NULL;
+    struct bpf_program *pout = NULL;
+    struct bpf_link *lin = NULL;
+    struct bpf_link *lout = NULL;
+    struct bpf_map *map = NULL;
+
+    char path_in[4096];
+    char path_out[4096];
+    char path_map[4096];
+
+    int cgfd = -1;
+    int err = 1;
+
+    obj = bpf_object__open_file(objfile, NULL);
+
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr,
+                "bpf_object__open_file falhou\n");
+        return 1;
+    }
+
+    if (bpf_object__load(obj)) {
+        fprintf(stderr,
+                "bpf_object__load falhou\n");
+        goto out;
+    }
+
+    pin = bpf_object__find_program_by_name(
+            obj,
+            "limit_ingress");
+
+    pout = bpf_object__find_program_by_name(
+            obj,
+            "limit_egress");
+
+    if (!pin || !pout) {
+        fprintf(stderr,
+                "programas ingress/egress não encontrados\n");
+        goto out;
+    }
+
+    map = bpf_object__find_map_by_name(
+            obj,
+            "buckets");
+
+    if (!map) {
+        fprintf(stderr,
+                "map buckets não encontrado\n");
+        goto out;
+    }
+
+    cgfd = open(cgpath, O_RDONLY | O_DIRECTORY);
+
+    if (cgfd < 0) {
+        fprintf(stderr,
+                "open(%s): %s\n",
+                cgpath,
+                strerror(errno));
+        goto out;
+    }
+
+    lin = bpf_program__attach_cgroup(pin, cgfd);
+
+    if (libbpf_get_error(lin)) {
+        fprintf(stderr,
+                "attach ingress falhou\n");
+        lin = NULL;
+        goto out;
+    }
+
+    lout = bpf_program__attach_cgroup(pout, cgfd);
+
+    if (libbpf_get_error(lout)) {
+        fprintf(stderr,
+                "attach egress falhou\n");
+        lout = NULL;
+        goto out;
+    }
+
+    snprintf(path_in,
+             sizeof(path_in),
+             "%s/ingress",
+             pindir);
+
+    snprintf(path_out,
+             sizeof(path_out),
+             "%s/egress",
+             pindir);
+
+    snprintf(path_map,
+             sizeof(path_map),
+             "%s/buckets",
+             pindir);
+
+    unlink(path_in);
+    unlink(path_out);
+    unlink(path_map);
+
+    if (bpf_link__pin(lin, path_in)) {
+        fprintf(stderr,
+                "não consegui pin ingress\n");
+        goto out;
+    }
+
+    if (bpf_link__pin(lout, path_out)) {
+        fprintf(stderr,
+                "não consegui pin egress\n");
+        unlink(path_in);
+        goto out;
+    }
+
+    if (bpf_map__pin(map, path_map)) {
+        fprintf(stderr,
+                "não consegui pin map\n");
+
+        unlink(path_in);
+        unlink(path_out);
+
+        goto out;
+    }
+
+    err = 0;
+
+out:
+
+    if (lin)
+        bpf_link__destroy(lin);
+
+    if (lout)
+        bpf_link__destroy(lout);
+
+    if (cgfd >= 0)
+        close(cgfd);
+
+    if (obj)
+        bpf_object__close(obj);
+
+    return err;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 2 &&
+        strcmp(argv[1], "load") == 0) {
+
+        if (argc != 5) {
+            fprintf(stderr,
+                    "uso: %s load OBJ CGROUP PINDIR\n",
+                    argv[0]);
+            return 1;
+        }
+
+        return load_program(
+                argv[2],
+                argv[3],
+                argv[4]);
+    }
+
+    if (argc >= 2 &&
+        strcmp(argv[1], "stats") == 0) {
+
+        if (argc != 3) {
+            fprintf(stderr,
+                    "uso: %s stats MAP\n",
+                    argv[0]);
+            return 1;
+        }
+
+        return show_stats(argv[2]);
+    }
+
+    fprintf(stderr,
+            "uso:\n"
+            "  %s load OBJ CGROUP PINDIR\n"
+            "  %s stats MAP\n",
+            argv[0],
+            argv[0]);
+
+    return 1;
+}
+EOF
+
+    gcc \
+        -O2 \
+        -Wall \
+        "$LOADER_SRC" \
+        -o "$LOADER" \
+        $(pkg-config --cflags --libs libbpf) \
+        -lelf \
+        -lz \
+        || die "erro compilando loader"
+
+    chmod 700 "$LOADER"
+
+    ok "loader compilado"
+}
+
+###############################################################################
+# Compilar BPF específico para aquele limite
+###############################################################################
+
+build_bpf()
+{
+    local pid="$1"
+    local down_bps="$2"
+    local up_bps="$3"
+    local state="$4"
+
+    local source="$state/limit.bpf.c"
+    local object="$state/limit.bpf.o"
+
+    command -v clang >/dev/null 2>&1 ||
+        die "clang não encontrado"
+
+    cat > "$source" <<EOF
+// SPDX-License-Identifier: GPL-2.0
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+#define DOWN_BPS ${down_bps}ULL
+#define UP_BPS   ${up_bps}ULL
+
+#define NS_PER_SEC 1000000000ULL
+
+/*
+ * Token bucket:
+ *
+ * 0 = download / ingress
+ * 1 = upload   / egress
+ */
+
+struct bucket_state {
+
+    struct bpf_spin_lock lock;
+    __u32 pad;
+
+    __u64 last_ns;
+    __u64 tokens;
+
+    __u64 allowed_bytes;
+    __u64 dropped_bytes;
+
+    __u64 allowed_packets;
+    __u64 dropped_packets;
+};
+
+struct {
+
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2);
+
+    __type(key, __u32);
+    __type(value, struct bucket_state);
+
+} buckets SEC(".maps");
+
+
+static __always_inline int enforce_rate(
+        struct __sk_buff *skb,
+        __u32 key,
+        __u64 rate_bps)
+{
+    struct bucket_state *s;
+
+    __u64 now;
+    __u64 delta;
+    __u64 add;
+
+    __u64 bytes_per_sec;
+    __u64 burst;
+
+    __u64 len;
+
+    int allow = 1;
+
+    /*
+     * 0 significa ilimitado.
+     */
+
+    if (rate_bps == 0)
+        return 1;
+
+    s = bpf_map_lookup_elem(&buckets, &key);
+
+    if (!s)
+        return 1;
+
+    now = bpf_ktime_get_ns();
+
+    len = skb->len;
+
+    bytes_per_sec = rate_bps / 8;
+
+    /*
+     * Burst máximo aproximado:
+     *
+     * 200 ms da banda configurada.
+     *
+     * Mínimo 32 KB para não destruir desempenho
+     * em taxas pequenas.
+     */
+
+    burst = bytes_per_sec / 5;
+
+    if (burst < (32ULL * 1024ULL))
+        burst = 32ULL * 1024ULL;
+
+
+    bpf_spin_lock(&s->lock);
+
+    if (s->last_ns == 0) {
+
+        s->last_ns = now;
+        s->tokens = burst;
+
+    } else {
+
+        delta = now - s->last_ns;
+
+        /*
+         * Não precisamos acumular mais que 1 segundo.
+         * Também evita multiplicações gigantes.
+         */
+
+        if (delta > NS_PER_SEC)
+            delta = NS_PER_SEC;
+
+        add = (delta * bytes_per_sec) /
+              NS_PER_SEC;
+
+        s->tokens += add;
+
+        if (s->tokens > burst)
+            s->tokens = burst;
+
+        s->last_ns = now;
+    }
+
+
+    if (s->tokens >= len) {
+
+        s->tokens -= len;
+
+        s->allowed_bytes += len;
+        s->allowed_packets++;
+
+        allow = 1;
+
+    } else {
+
+        /*
+         * cgroup_skb não possui uma fila de shaping
+         * como HTB/TBF.
+         *
+         * Para produzir congestionamento e reduzir
+         * TCP nós descartamos quando acaba o bucket.
+         */
+
+        s->dropped_bytes += len;
+        s->dropped_packets++;
+
+        allow = 0;
+    }
+
+    bpf_spin_unlock(&s->lock);
+
+    return allow;
+}
+
+
+SEC("cgroup_skb/ingress")
+int limit_ingress(struct __sk_buff *skb)
+{
+    return enforce_rate(
+            skb,
+            0,
+            DOWN_BPS);
+}
+
+
+SEC("cgroup_skb/egress")
+int limit_egress(struct __sk_buff *skb)
+{
+    return enforce_rate(
+            skb,
+            1,
+            UP_BPS);
+}
+
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+
+    local multiarch
+
+    multiarch=$(gcc -dumpmachine)
+
+    info "Compilando eBPF..."
+
+    if ! clang \
+        -O2 \
+        -g \
+        -target bpf \
+        -I"/usr/include/$multiarch" \
+        -D__TARGET_ARCH_x86 \
+        -c "$source" \
+        -o "$object"
+    then
+        echo
+        die "falha compilando eBPF. Verifique se seu clang possui backend BPF."
+    fi
+
+    [[ -s "$object" ]] ||
+        die "objeto BPF não foi criado"
+
+    ok "eBPF compilado"
+
+    echo "$object"
+}
+
+###############################################################################
+# Descobrir árvore de processos
+###############################################################################
+
+collect_process_tree()
+{
+    local root="$1"
+
+    declare -gA TARGETS
+    declare -gA EXCLUDE
+
+    TARGETS=()
+    EXCLUDE=()
+
+    #
+    # Primeiro excluímos o próprio limitpid e a cadeia
+    # que o chamou.
+    #
+    # Isso é especialmente importante se fizermos:
+    #
+    #   sudo limitpid apply $$ 10M 2M
+    #
+    # Senão moveríamos o sudo/limitpid junto.
+    #
+
+    local p=$$
+    local pp
+
+    while [[ "$p" =~ ^[0-9]+$ ]] &&
+          (( p > 1 )) &&
+          [[ "$p" != "$root" ]]
+    do
+        EXCLUDE["$p"]=1
+
+        pp=$(get_ppid "$p" 2>/dev/null || echo 1)
+
+        [[ "$pp" =~ ^[0-9]+$ ]] || break
+
+        p="$pp"
+    done
+
+    TARGETS["$root"]=1
+
+    local changed=1
+
+    while (( changed )); do
+
+        changed=0
+
+        local proc
+        local pid
+        local ppid
+
+        for proc in /proc/[0-9]*; do
+
+            pid="${proc#/proc/}"
+
+            [[ "${EXCLUDE[$pid]+x}" ]] &&
+                continue
+
+            [[ "${TARGETS[$pid]+x}" ]] &&
+                continue
+
+            ppid=$(get_ppid "$pid" 2>/dev/null || true)
+
+            [[ -n "$ppid" ]] ||
+                continue
+
+            if [[ "${TARGETS[$ppid]+x}" ]]; then
+
+                TARGETS["$pid"]=1
+                changed=1
+            fi
+        done
+    done
+}
+
+###############################################################################
+# APPLY
+###############################################################################
+
+cmd_apply()
+{
+    need_root "$@"
+
+    [[ $# -eq 3 ]] ||
+        die "uso: limitpid apply PID DOWNLOAD UPLOAD"
+
+    local pid="$1"
+    local down="$2"
+    local up="$3"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] ||
+        die "PID inválido"
+
+    [[ -d "/proc/$pid" ]] ||
+        die "PID $pid não existe"
+
+    local down_bps
+    local up_bps
+
+    down_bps=$(parse_rate "$down") ||
+        die "DOWNLOAD inválido: $down"
+
+    up_bps=$(parse_rate "$up") ||
+        die "UPLOAD inválido: $up"
+
+    (( down_bps > 0 )) ||
+        die "download deve ser > 0"
+
+    (( up_bps > 0 )) ||
+        die "upload deve ser > 0"
+
+    check_environment
+    build_loader
+
+    local state="$RUNROOT/$pid"
+    local cg="$CGROOT/limitpid/$pid"
+    local pin="$BPFROOT/limitpid/$pid"
+
+    if [[ -d "$state" ]]; then
+        die "PID $pid já possui configuração. Use 'limitpid remove $pid'."
+    fi
+
+    mkdir -p "$state"
+    mkdir -p "$cg"
+    mkdir -p "$pin"
+
+    local root_cgroup
+
+    root_cgroup=$(get_cgroup "$pid") ||
+        die "não consegui descobrir cgroup original"
+
+    echo "$root_cgroup" > "$state/root_cgroup"
+
+    echo "$down"     > "$state/down"
+    echo "$up"       > "$state/up"
+    echo "$down_bps" > "$state/down_bps"
+    echo "$up_bps"   > "$state/up_bps"
+
+    printf '%s\n' "$pid" > "$state/root_pid"
+
+    collect_process_tree "$pid"
+
+    : > "$state/original.tsv"
+
+    info "Processos encontrados: ${#TARGETS[@]}"
+
+    local p
+    local start
+    local orig
+
+    for p in "${!TARGETS[@]}"; do
+
+        [[ -d "/proc/$p" ]] ||
+            continue
+
+        start=$(get_starttime "$p" 2>/dev/null || true)
+        orig=$(get_cgroup "$p" 2>/dev/null || true)
+
+        [[ -n "$start" && -n "$orig" ]] ||
+            continue
+
+        printf '%s\t%s\t%s\n' \
+            "$p" \
+            "$start" \
+            "$orig" \
+            >> "$state/original.tsv"
+
+        printf "  %-8s %-22s %s\n" \
+            "$p" \
+            "$(get_comm "$p")" \
+            "$orig"
+    done
+
+    #
+    # Compilar primeiro e anexar BPF enquanto cgroup
+    # ainda está vazio.
+    #
+
+    local object
+
+    build_bpf \
+        "$pid" \
+        "$down_bps" \
+        "$up_bps" \
+        "$state"
+
+    object="$state/limit.bpf.o"
+
+    [[ -f "$object" ]] ||
+        die "arquivo eBPF não encontrado: $object"
+
+    info "Anexando eBPF ao cgroup..."
+
+    if ! "$LOADER" load \
+        "$object" \
+        "$cg" \
+        "$pin"
+    then
+
+        rm -f "$pin"/* 2>/dev/null || true
+
+        rmdir "$pin" 2>/dev/null || true
+        rmdir "$cg" 2>/dev/null || true
+
+        rm -rf "$state"
+
+        die "não consegui anexar os programas eBPF"
+    fi
+
+    ok "eBPF ingress + egress anexado"
+
+    #
+    # Somente agora movemos os processos.
+    #
+
+    info "Movendo processos para $cg..."
+
+    local moved=0
+
+    while IFS=$'\t' read -r p start orig; do
+
+        [[ -d "/proc/$p" ]] ||
+            continue
+
+        local current_start
+
+        current_start=$(get_starttime "$p" 2>/dev/null || true)
+
+        [[ "$current_start" == "$start" ]] ||
+            continue
+
+	if echo "$p" > "$cg/cgroup.procs" 2>/dev/null; then
+
+	    sleep 0.05
+
+	    current_cgroup=$(get_cgroup "$p" 2>/dev/null || true)
+
+	    expected_cgroup="/limitpid/$pid"
+
+        if [[ "$current_cgroup" == "$expected_cgroup" ]]; then
+	    ((moved++)) || true
+	else
+    	    warn "PID $p foi movido, mas NÃO permaneceu no cgroup"
+    	    warn "esperado : $expected_cgroup"
+    	    warn "atual    : ${current_cgroup:-DESCONHECIDO}"
+	fi
+
+else
+    warn "não consegui mover PID $p"
+fi
+
+
+
+    done < "$state/original.tsv"
+
+    echo
+
+    echo "${BOLD}LIMITADOR ATIVO${RESET}"
+    echo
+    echo " PID raiz : $pid ($(get_comm "$pid"))"
+    echo " Download : $down"
+    echo " Upload   : $up"
+    echo " Processos: $moved"
+    echo " Cgroup   : $cg"
+    echo
+    echo " tc       : NÃO UTILIZADO"
+    echo " iptables : NÃO UTILIZADO"
+    echo " nftables : NÃO UTILIZADO"
+    echo
+
+    echo "${BOLD}Processos atualmente no cgroup:${RESET}"
+
+    if [[ -s "$cg/cgroup.procs" ]]; then
+
+        while read -r p; do
+            printf "  %-8s %s\n" \
+                "$p" \
+                "$(get_comm "$p")"
+        done < "$cg/cgroup.procs"
+
+    else
+        echo "  nenhum"
+    fi
+
+    echo
+    echo "Use:"
+    echo
+    echo "  limitpid status $pid"
+    echo "  limitpid remove $pid"
+}
+
+###############################################################################
+# STATUS
+###############################################################################
+
+cmd_status()
+{
+    need_root "$@"
+
+    [[ $# -eq 1 ]] ||
+        die "uso: limitpid status PID"
+
+    local pid="$1"
+
+    local state="$RUNROOT/$pid"
+    local cg="$CGROOT/limitpid/$pid"
+    local pin="$BPFROOT/limitpid/$pid"
+
+    [[ -d "$state" ]] ||
+        die "PID $pid não possui limitador registrado"
+
+    local down
+    local up
+
+    down=$(<"$state/down")
+    up=$(<"$state/up")
+
+    echo
+    echo "${BOLD}LIMITPID $VERSION${RESET}"
+    echo
+    echo " PID raiz : $pid"
+
+    if [[ -d "/proc/$pid" ]]; then
+        echo " Processo  : $(get_comm "$pid")"
+        echo " Estado    : executando"
+    else
+        echo " Processo  : encerrado"
+        echo " Estado    : PID não existe mais"
+    fi
+
+    echo
+    echo " Download  : $down"
+    echo " Upload    : $up"
+    echo
+    echo " Cgroup    : $cg"
+    echo
+
+    echo "${BOLD}Processos:${RESET}"
+
+    local count=0
+    local p
+
+    if [[ -r "$cg/cgroup.procs" ]]; then
+
+        while read -r p; do
+
+            [[ -n "$p" ]] || continue
+
+            ((count++)) || true
+
+            printf "  %-8s %s\n" \
+                "$p" \
+                "$(get_comm "$p")"
+
+        done < "$cg/cgroup.procs"
+    fi
+
+    if (( count == 0 )); then
+        echo "  nenhum"
+    fi
+
+    echo
+    echo "${BOLD}eBPF:${RESET}"
+
+    [[ -e "$pin/ingress" ]] &&
+        echo "  ingress : ATIVO" ||
+        echo "  ingress : AUSENTE"
+
+    [[ -e "$pin/egress" ]] &&
+        echo "  egress  : ATIVO" ||
+        echo "  egress  : AUSENTE"
+
+    echo
+    echo "${BOLD}Estatísticas:${RESET}"
+
+    if [[ -e "$pin/buckets" ]]; then
+        "$LOADER" stats "$pin/buckets"
+    else
+        echo "  mapa BPF não encontrado"
+    fi
+
+    echo
+
+    if command -v tc >/dev/null 2>&1; then
+
+        #
+        # Não mudamos nada aqui. Só podemos provar que
+        # não há nenhuma estrutura "limitpid" no tc.
+        #
+
+        echo "tc: nenhuma configuração é criada pelo limitpid."
+    fi
+
+    echo
+}
+
+###############################################################################
+# REMOVE
+###############################################################################
+
+cmd_remove()
+{
+    need_root "$@"
+
+    [[ $# -eq 1 ]] ||
+        die "uso: limitpid remove PID"
+
+    local pid="$1"
+
+    local state="$RUNROOT/$pid"
+    local cg="$CGROOT/limitpid/$pid"
+    local pin="$BPFROOT/limitpid/$pid"
+
+    [[ -d "$state" ]] ||
+        die "PID $pid não possui limitador registrado"
+
+    local root_cgroup="/"
+
+    if [[ -r "$state/root_cgroup" ]]; then
+        root_cgroup=$(<"$state/root_cgroup")
+    fi
+
+    info "Restaurando cgroups originais..."
+
+    if [[ -r "$state/original.tsv" ]]; then
+
+        local p
+        local old_start
+        local orig
+        local current_start
+        local destination
+
+        while IFS=$'\t' read -r p old_start orig; do
+
+            [[ -d "/proc/$p" ]] ||
+                continue
+
+            current_start=$(get_starttime "$p" 2>/dev/null || true)
+
+            #
+            # Impede que um PID reutilizado seja movido
+            # acidentalmente.
+            #
+
+            [[ "$current_start" == "$old_start" ]] ||
+                continue
+
+            destination="$CGROOT$orig"
+
+            if [[ ! -d "$destination" ]]; then
+                destination="$CGROOT$root_cgroup"
+            fi
+
+            if [[ ! -d "$destination" ]]; then
+                destination="$CGROOT"
+            fi
+
+            echo "$p" > "$destination/cgroup.procs" \
+                2>/dev/null || \
+                warn "não consegui restaurar PID $p"
+
+        done < "$state/original.tsv"
+    fi
+
+    #
+    # Processos que nasceram DEPOIS do apply não estão
+    # em original.tsv.
+    #
+    # Eles herdaram nosso cgroup.
+    #
+    # Vamos devolvê-los ao cgroup original do PID raiz.
+    #
+
+    if [[ -r "$cg/cgroup.procs" ]]; then
+
+        local fallback="$CGROOT$root_cgroup"
+
+        [[ -d "$fallback" ]] ||
+            fallback="$CGROOT"
+
+        local remaining
+
+        while read -r remaining; do
+
+            [[ -n "$remaining" ]] ||
+                continue
+
+            if [[ -d "/proc/$remaining" ]]; then
+
+                echo "$remaining" \
+                    > "$fallback/cgroup.procs" \
+                    2>/dev/null || \
+                    warn "não consegui restaurar PID $remaining"
+            fi
+
+        done < "$cg/cgroup.procs"
+    fi
+
+    #
+    # Remover pins mata os links BPF depois que não
+    # existem mais descritores referenciando-os.
+    #
+
+    info "Removendo programas eBPF..."
+
+    rm -f "$pin/ingress" 2>/dev/null || true
+    rm -f "$pin/egress"  2>/dev/null || true
+    rm -f "$pin/buckets" 2>/dev/null || true
+
+    rmdir "$pin" 2>/dev/null || true
+
+    #
+    # Cgroup deve estar vazio agora.
+    #
+
+    if [[ -d "$cg" ]]; then
+
+        if ! rmdir "$cg" 2>/dev/null; then
+
+            warn "cgroup ainda não pôde ser removido: $cg"
+
+            if [[ -r "$cg/cgroup.procs" ]]; then
+                echo "Processos restantes:"
+                cat "$cg/cgroup.procs"
+            fi
+        fi
+    fi
+
+    rm -rf "$state"
+
+    ok "limitador removido"
+
+    echo
+    echo "PID       : $pid"
+    echo "eBPF      : removido"
+    echo "cgroup    : restaurado"
+    echo "tc        : não foi alterado"
+    echo "iptables  : não foi alterado"
+    echo "nftables  : não foi alterado"
+    echo
+}
+
+###############################################################################
+# LIST
+###############################################################################
+
+cmd_list()
+{
+    need_root "$@"
+
+    echo
+    printf "%-10s %-22s %-12s %-12s\n" \
+        "PID" \
+        "PROCESSO" \
+        "DOWNLOAD" \
+        "UPLOAD"
+
+    printf "%-10s %-22s %-12s %-12s\n" \
+        "----------" \
+        "----------------------" \
+        "------------" \
+        "------------"
+
+    local d
+    local pid
+    local down
+    local up
+
+    for d in "$RUNROOT"/[0-9]*; do
+
+        [[ -d "$d" ]] || continue
+
+        pid="${d##*/}"
+
+        down=$(cat "$d/down" 2>/dev/null || echo "?")
+        up=$(cat "$d/up" 2>/dev/null || echo "?")
+
+        printf "%-10s %-22s %-12s %-12s\n" \
+            "$pid" \
+            "$(get_comm "$pid")" \
+            "$down" \
+            "$up"
+    done
+
+    echo
+}
+
+###############################################################################
+# HELP
+###############################################################################
+
+usage()
+{
+    cat <<EOF
+
+limitpid $VERSION
+
+Limitação de banda por PID usando cgroup v2 + eBPF.
+
+USO:
+
+    limitpid apply PID DOWNLOAD UPLOAD
+
+    limitpid status PID
+
+    limitpid remove PID
+
+    limitpid list
+
+
+EXEMPLOS:
+
+    limitpid apply 12345 10M 2M
+
+        download = 10 Mbit/s
+        upload   =  2 Mbit/s
+
+
+    limitpid status 12345
+
+
+    limitpid remove 12345
+
+
+    limitpid list
+
+
+UNIDADES:
+
+    K = kbit/s
+    M = Mbit/s
+    G = Gbit/s
+
+
+EXEMPLO SHELL:
+
+    echo \$\$
+
+    sudo limitpid apply \$\$ 5M 1M
+
+    wget https://speed.hetzner.de/100MB.bin
+
+
+NÃO UTILIZA:
+
+    tc
+    iptables
+    nftables
+
+EOF
+}
+
+###############################################################################
+# MAIN
+###############################################################################
+
+case "${1:-}" in
+
+    apply)
+        shift
+        cmd_apply "$@"
+        ;;
+
+    status)
+        shift
+        cmd_status "$@"
+        ;;
+
+    remove)
+        shift
+        cmd_remove "$@"
+        ;;
+
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+
+    -h|--help|help|"")
+        usage
+        ;;
+
+    *)
+        die "comando desconhecido: $1"
+        ;;
+esac
+

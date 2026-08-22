@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+LIMITPID="/usr/local/sbin/limitpid"
+die(){ echo "limitpid-gui-helper: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "deve ser executado como root"
+[[ -x "$LIMITPID" ]] || die "$LIMITPID nao encontrado"
+valid_pid(){ [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
+# Unidade OBRIGATORIA. Sem sufixo o backend interpreta como bps puro
+# (parse_rate), entao "10" viraria 10 bits/s -- armadilha silenciosa. A GUI ja
+# exige unidade; aqui o CLI da GUI passa a exigir tambem.
+valid_rate(){ [[ "${1:-}" =~ ^[1-9][0-9]*(K|M|G)$ ]]; }
+# Nome de container: SO nome, nunca caminho. Barra, ".." e metacaracteres de
+# shell sao rejeitados aqui, antes de chegar ao backend -- que por sua vez
+# resolve o cgroup sozinho e recusa qualquer coisa fora de docker-*.scope.
+# Duas barreiras independentes, de proposito.
+valid_name(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; }
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  health) [[ $# -eq 0 ]]||die "argumentos invalidos"; printf '{"mode":"real","privileged":true}\n' ;;
+  snapshot) [[ $# -eq 0 ]]||die "argumentos invalidos"; exec "$LIMITPID" snapshot --json ;;
+  apply) [[ $# -eq 3 || $# -eq 4 ]]||die "uso: apply PID DOWN UP [--reset-connections]"; valid_pid "$1"||die "PID invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; [[ -z "${4:-}" || "${4:-}" == "--reset-connections" ]]||die "flag invalida"; exec "$LIMITPID" apply "$1" "$2" "$3" ${4:+"$4"} ;;
+  change) [[ $# -eq 3 ]]||die "uso: change ID DOWN UP"; valid_pid "$1"||die "ID invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" change "$1" "$2" "$3" ;;
+  remove) [[ $# -eq 1 ]]||die "uso: remove ID"; valid_pid "$1"||die "ID invalido"; exec "$LIMITPID" remove "$1" ;;
+  containers) [[ $# -eq 0 ]]||die "argumentos invalidos"; exec "$LIMITPID" containers ;;
+  cgroup) [[ $# -eq 3 ]]||die "uso: cgroup NOME DOWN UP"; valid_name "$1"||die "nome de container invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup "$1" "$2" "$3" ;;
+  cgroup-change) [[ $# -eq 3 ]]||die "uso: cgroup-change NOME DOWN UP"; valid_name "$1"||die "nome de container invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup-change "$1" "$2" "$3" ;;
+  cgroup-remove) [[ $# -eq 1 ]]||die "uso: cgroup-remove NOME"; valid_name "$1"||die "nome de container invalido"; exec "$LIMITPID" cgroup-remove "$1" ;;
+  *) die "operacao nao permitida: ${cmd:-vazia}" ;;
+esac

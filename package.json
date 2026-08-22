@@ -1,0 +1,20 @@
+{
+  "name": "limitpid-gui",
+  "version": "0.1.0",
+  "description": "Interface grafica para LimitPID cgroup v2 + eBPF",
+  "main": "electron.js",
+  "type": "commonjs",
+  "scripts": {
+    "web": "node server.js",
+    "desktop": "electron .",
+    "check": "node scripts/check.js",
+    "css": "node -e \"const f=require('fs');f.writeFileSync('public/css/app.css',f.readFileSync('public/css/app.source.css','utf8').split('\\n').filter(l=>!l.trim().startsWith('/*')&&!l.trim().startsWith('*')&&l.trim()).join(''))\""
+  },
+  "dependencies": {
+    "express": "5.2.1",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "electron": "43.2.0"
+  }
+}
