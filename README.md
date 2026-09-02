@@ -24,10 +24,11 @@ The backend is fully usable on its own from the command line. The GUI is conveni
 
 ![The LimitPID GUI](assets/screenshot.png)
 
-Above: two processes capped at 4 Mbit/s (`curl` and a load script) running at 100% of
-their ceiling, and the container `web-downloader` capped at 10 Mbit/s pulling 10.2 Mbps.
-The other processes show `∞` because they have no limiter — their rate comes from
-`tcp_info`.
+Above: `curl` and `bash` capped at **4M ↓ / 1M ↑**, both running at **97.1%** of their
+ceiling — the utilization bar comes from the eBPF counters, which are exact. The container
+`web-downloader` is capped at **10M / 5M** and idle at capture time. The other processes
+show `∞` because they have no limiter; their rate comes from `tcp_info`, hence the `tcp`
+marker.
 
 ---
 

@@ -24,9 +24,10 @@ O backend funciona sozinho pela linha de comando. A GUI é conveniência.
 
 ![A GUI do LimitPID](assets/screenshot.png)
 
-Acima: dois processos limitados a 4 Mbit/s (`curl` e um script de carga) rodando a 100%
-do teto, e o container `web-downloader` limitado a 10 Mbit/s puxando 10,2 Mbps. Os demais
-processos aparecem com `∞` porque não têm limitador — a taxa deles vem do `tcp_info`.
+Acima: `curl` e `bash` limitados a **4M ↓ / 1M ↑**, ambos a **97,1%** do teto — a barra
+de utilização vem dos contadores eBPF, exatos. O container `web-downloader` está limitado
+a **10M / 5M** e ocioso no momento da captura. Os demais processos mostram `∞` porque não
+têm limitador; a taxa deles vem do `tcp_info` e por isso traz o marcador `tcp`.
 
 ---
 
