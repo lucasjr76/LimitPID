@@ -144,7 +144,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.3 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.4 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -215,10 +215,11 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.3 x 0.6.3
-OK  Marcador net-helper.api: 2-0.6.3 (esperado 2-0.6.3)
-OK  Copia do helper Python: limitpid-net-v0.6.3.py
+OK  VERSION bash x python embutido: 0.6.4 x 0.6.4
+OK  Marcador net-helper.api: 2-0.6.4 (esperado 2-0.6.4)
+OK  Copia do helper Python: limitpid-net-v0.6.4.py
 OK  app.css em dia com app.source.css
+OK  app.js: taxaDown e escapando (8 casos)
 ```
 
 ### Passo 6 — rodar
@@ -632,10 +633,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.3               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.6.4               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.3.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.6.4.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 SCHEMA = 2
 RUNROOT = pathlib.Path("/run/limitpid")
 CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
@@ -265,6 +265,10 @@ def read_limiter(root_pid):
         "limit_down_bps": read_int(state / 'down_bps', 0),
         "limit_up_bps": read_int(state / 'up_bps', 0),
         "cgroup": f"/limitpid/{root_pid}",
+        # Conexoes que ja existiam quando o limitador subiu: elas carregam o
+        # carimbo do cgroup antigo e escapam. A GUI usa isto junto com
+        # counters.down_allowed_bytes == 0 para avisar de forma permanente.
+        "foreign_conns": read_int(state / 'foreign_conns', 0),
         "member_pids": members,
         "members": member_info,
         "member_count": len(members),

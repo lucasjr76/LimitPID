@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.3.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.4.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -99,6 +99,19 @@ Detectado por `tun_bypass()`: algum processo do cgroup mantém `/dev/net/tun` ab
 **VM/TAP escapa** na GUI e o estado `TAP/VM` no `limitpid containers`.
 **Não há correção possível no eBPF de cgroup** — traffic shaping de TAP exigiria `tc`,
 que este projeto não usa.
+
+### Limitador ativo que nao ve byte nenhum (v0.6.4)
+Consequencia direta do carimbo de socket: se o processo ja tinha conexoes abertas
+quando o `apply` rodou, o limitador sobe, fica `executando`, e **os contadores eBPF
+ficam em zero**. Na tela isso era `20M / 0.00 bps / 0.0%` — visualmente identico a
+"nao funcionou". Aconteceu de verdade com o LM Studio em 2026-09-02.
+
+O backend ja calculava o numero (`count_foreign_sockets`) e avisava no `apply`, mas o
+aviso ia para um toast que some. A v0.6.4 **grava** esse numero em
+`/run/limitpid/<PID>/foreign_conns` e expoe como `foreign_conns` no limitador do
+snapshot. A GUI mostra, de forma permanente, `N conexão(ões) anterior(es) escapam` na
+coluna Utilizacao e um paragrafo no painel lateral. Some sozinho quando passar trafego
+(`down_allowed_bytes > 0`).
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
@@ -178,6 +191,14 @@ Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 cam
 - `docker ps` é cacheado 4s em `/run/limitpid/.docker-ps.json`.
 - Helper exige unidade na taxa (`10M`, não `10`): sem sufixo o backend leria bps puro.
 - A tabela é reconciliada por PID (nunca refeita inteira): preserva seleção e foco.
+- Ordenação padrão usa `taxaDown()` = taxa do limitador **ou** a taxa TCP. Antes usava só
+  a do limitador (0 para todo processo sem limite) e desempatava por nº de conexões:
+  quem baixava 92 Mbit/s por uma única conexão afundava para o fim da lista. Medido com
+  o LM Studio. `scripts/test-app.js` trava a regressão.
+- **Não existe `×` em linha de processo** e nunca existiu — remover limite de processo é
+  só pelo painel lateral, com confirmação. O `×` é exclusivo da linha de container.
+- O log do `sudo` (`journalctl | grep limitpid-gui-helper`) registra todo `apply`,
+  `change` e `remove` com horário. É a forma mais rápida de reconstruir o que a GUI fez.
 
 ## Armadilha do CSS gerado — incidente de 2026-09-02
 
@@ -218,8 +239,8 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
 - **Meça, não suponha.** Todo achado deste projeto veio de experimento controlado;
   várias hipóteses "óbvias" foram refutadas por medição.
 - `npm run check` valida as DUAS constantes VERSION, o marcador em disco, os pins de
-  dependência e a sincronia `app.source.css` → `app.css` — rode depois de todo
-  `install`. Foi ele que pegou o backend 0.6.1 rodando Python 0.6.0.
+  dependência, a sincronia `app.source.css` → `app.css` e roda `scripts/test-app.js` —
+  rode depois de todo `install`. Foi ele que pegou o backend 0.6.1 rodando Python 0.6.0.
 - CSS: editar `public/css/app.source.css` (legível) e rodar `npm run css`
   (`scripts/css.js`). **Nunca** editar `app.css` na mão — ele é gerado.
   O `npm run check` compara os dois e reprova se estiverem fora de sincronia.
@@ -241,5 +262,10 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
 - **VM em container não é limitável** (ver *Armadilha do TAP*). A GUI avisa; não corrige.
 - `docker compose down/up` e recriação com mesmo nome não testados (devem cair em
   `sumido` ou `morto`, mas é raciocínio, não medição).
+- **`remove` pode devolver o processo ao cgroup raiz** (`0::/`) em vez do escopo systemd
+  original. Observado com o LM Studio em 2026-09-02: depois de um ciclo apply/remove ele
+  ficou fora de `app-*.scope`. Não reproduzido nem explicado — o `remove` faz `rm -rf` do
+  estado no fim, então o `original.tsv` daquela execução foi destruído junto com a
+  evidência. Preservar o estado num `.trash` antes do `rm -rf` resolveria o diagnóstico.
 - Taxa de processo não limitado é **TCP apenas** (v0.6). UDP/QUIC mostram 0 — normal,
   não é bug. Navegador moderno usa QUIC e por isso costuma marcar 0.

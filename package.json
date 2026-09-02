@@ -7,7 +7,7 @@
   "scripts": {
     "web": "node server.js",
     "desktop": "electron .",
-    "check": "node scripts/check.js",
+    "check": "node scripts/check.js && node scripts/test-app.js",
     "css": "node scripts/css.js"
   },
   "dependencies": {
