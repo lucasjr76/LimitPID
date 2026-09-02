@@ -241,8 +241,16 @@ Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 cam
   a do limitador (0 para todo processo sem limite) e desempatava por nº de conexões:
   quem baixava 92 Mbit/s por uma única conexão afundava para o fim da lista. Medido com
   o LM Studio. `scripts/test-app.js` trava a regressão.
-- **Não existe `×` em linha de processo** e nunca existiu — remover limite de processo é
-  só pelo painel lateral, com confirmação. O `×` é exclusivo da linha de container.
+- **O `×` da linha de processo é novo (v0.6.6+).** Até então ele existia **só** na linha
+  de container — verificado em todos os commits e nos 6 backups desde 2026-08-22, todos
+  com `data-cdel` (container) e nenhum equivalente em processo. Remover limite de processo
+  exigia abrir o painel lateral e achar "Remover limite": três passos, descobertos por
+  acaso. A assimetria confundiu o autor duas vezes ("o × sumiu?"), o que é o sintoma
+  clássico de UI inconsistente. Agora as duas tabelas têm `Alterar` + `×`.
+- O `×` reaproveita `removeLimit()` (mesma confirmação). `ligaLinha()` exclui
+  `[data-del]` do clique que abre o painel lateral, senão clicar no × abriria o drawer
+  junto. A troca `Limitar`↔`Alterar` já forçava a recriação da linha, então o `×`
+  aparece e some sozinho — a reconciliação não precisou mudar.
 - O log do `sudo` (`journalctl | grep limitpid-gui-helper`) registra todo `apply`,
   `change` e `remove` com horário. É a forma mais rápida de reconstruir o que a GUI fez.
 

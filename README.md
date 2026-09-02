@@ -540,6 +540,7 @@ What it shows:
 - Totals in the header summing **PIDs + containers**.
 - A side drawer per process, with its connections and eBPF counters.
 - Sorting by Process, PID, Connections, Download and Upload (clickable header).
+- `Alterar` and `×` on every limited row, in both tables — process and container.
 - Browser-style zoom: `Ctrl +` / `Ctrl -` / `Ctrl 0` and `Ctrl + wheel`, persisted.
 - A tray icon with a menu (Open / Quit); where there is no tray, `Ctrl+Q` quits.
 - `ESC` closes the drawer; rows are keyboard-navigable.

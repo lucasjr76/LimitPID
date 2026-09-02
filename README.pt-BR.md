@@ -533,6 +533,7 @@ O que ela mostra:
 - Totais no topo somando **PIDs + containers**.
 - Painel lateral por processo, com as conexões e os contadores eBPF.
 - Ordenação por Processo, PID, Conexões, Download e Upload (cabeçalho clicável).
+- `Alterar` e `×` em toda linha limitada, nas duas tabelas — processo e container.
 - Zoom estilo navegador: `Ctrl +` / `Ctrl -` / `Ctrl 0` e `Ctrl + roda`, persistido.
 - Bandeja com menu (Abrir / Sair); onde não há bandeja, `Ctrl+Q` encerra.
 - `ESC` fecha o painel lateral; as linhas são navegáveis por teclado.

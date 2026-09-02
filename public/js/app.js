@@ -100,12 +100,17 @@ function linhaHTML(p){
     `<td>${l?`<span class="badge limit">${esc(limTexto(l.limit_down,l.limit_down_bps))}</span>`:'∞'}</td>`+
     `<td>${l?`<span class="badge limit">${esc(limTexto(l.limit_up,l.limit_up_bps))}</span>`+(orfao(l)?` <span class="badge tun" title="${l.orphan_at_apply} processo(s) já estavam na raiz do cgroup quando este limite foi aplicado — órfãos de um ciclo anterior que destruiu o escopo systemd deles. O limite funciona; eles é que estão fora de qualquer unit. Reinicie o app para recuperar.">órfão</span>`:''):'∞'}</td>`+
     `<td>${c.util}</td>`+
-    `<td><button class="tiny" data-limit="${p.pid}">${l?'Alterar':'Limitar'}</button></td>`;
+    // O × so existia na linha de CONTAINER. Remover limite de processo exigia
+    // abrir o painel lateral e achar "Remover limite" -- tres passos, e so se
+    // descobre por acaso. A assimetria confundiu o autor duas vezes ("o × sumiu?").
+    `<td><button class="tiny" data-limit="${p.pid}">${l?'Alterar':'Limitar'}</button>`+
+    (l?` <button class="tiny" data-del="${l.id}" title="Remover limite">×</button>`:'')+`</td>`;
 }
 function ligaLinha(tr){
-  tr.onclick=e=>{if(!e.target.closest('[data-limit]'))openDrawer(Number(tr.dataset.pid))};
+  tr.onclick=e=>{if(!e.target.closest('[data-limit],[data-del]'))openDrawer(Number(tr.dataset.pid))};
   tr.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();openDrawer(Number(tr.dataset.pid))}};
   const b=tr.querySelector('[data-limit]'); if(b)b.onclick=()=>openDialog(Number(tr.dataset.pid));
+  const x=tr.querySelector('[data-del]'); if(x)x.onclick=()=>removeLimit(Number(x.dataset.del));
 }
 // Reconciliacao por PID: reaproveita a <tr> existente, move de posicao quando a
 // ordem muda e so recria o que e novo. A lista de processos oscila a cada tick
