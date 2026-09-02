@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.4.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.5.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -112,6 +112,38 @@ aviso ia para um toast que some. A v0.6.4 **grava** esse numero em
 snapshot. A GUI mostra, de forma permanente, `N conexão(ões) anterior(es) escapam` na
 coluna Utilizacao e um paragrafo no painel lateral. Some sozinho quando passar trafego
 (`down_allowed_bytes > 0`).
+
+### Escopo systemd destruido pelo apply (v0.6.5) — REPRODUZIDO
+`apply` move **todos** os processos para `/sys/fs/cgroup/limitpid/<PID>`. Se eles vinham
+de um escopo systemd, esse escopo fica vazio e **o systemd coleta a unit**. No `remove`
+o destino original nao existe mais e o processo cai na **raiz** (`0::/`), fora de
+qualquer escopo — perde o vinculo com o `systemd --user`, e o `systemctl` deixa de
+enxerga-lo.
+
+Reproduzido de forma deterministica em 2026-09-02:
+
+```bash
+systemd-run --user --scope --unit=lp-autopsia.scope --collect sleep 400
+sudo limitpid apply <PID> 5M 1M     # escopo esvazia
+test -d /sys/fs/cgroup/.../lp-autopsia.scope   # SUMIU
+sudo limitpid remove <PID>          # AVISO: 1 processo(s) NAO voltaram ao cgroup original
+```
+
+Era o que tinha acontecido com o LM Studio. Antes da v0.6.5 isso passava calado: o
+`remove` imprimia "processos: restaurados ao cgroup original" mesmo largando o processo
+na raiz, e apagava o estado com `rm -rf`, destruindo a evidencia junto.
+
+A v0.6.5 **nao corrige** — o `apply` continua esvaziando o escopo. Ela **detecta**:
+
+- confere `/proc/<PID>/cgroup` depois de cada escrita e compara com o pretendido;
+- `AVISO: N processo(s) NAO voltaram ao cgroup original` no terminal, e toast vermelho
+  na GUI (`remove` agora devolve o stderr, como o `apply` ja fazia);
+- o estado vai para `$RUNROOT/.trash/<pid>-<epoch>/` em vez de ser apagado, com um
+  `restore.log` (`pid → pretendido → efetivo → situacao`). O `gc` limpa em `TRASH_TTL`
+  (3600s) e reporta "Autopsias expiradas".
+
+Correcao de verdade exigiria o `apply` manter o escopo vivo (deixar um processo para
+tras, ou recriar a unit no `remove`). Nao feito.
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
@@ -262,10 +294,9 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
 - **VM em container não é limitável** (ver *Armadilha do TAP*). A GUI avisa; não corrige.
 - `docker compose down/up` e recriação com mesmo nome não testados (devem cair em
   `sumido` ou `morto`, mas é raciocínio, não medição).
-- **`remove` pode devolver o processo ao cgroup raiz** (`0::/`) em vez do escopo systemd
-  original. Observado com o LM Studio em 2026-09-02: depois de um ciclo apply/remove ele
-  ficou fora de `app-*.scope`. Não reproduzido nem explicado — o `remove` faz `rm -rf` do
-  estado no fim, então o `original.tsv` daquela execução foi destruído junto com a
-  evidência. Preservar o estado num `.trash` antes do `rm -rf` resolveria o diagnóstico.
+- **`apply` destrói o escopo systemd do processo** e o `remove` o larga na raiz
+  (`0::/`). Causa reproduzida e documentada (ver *Escopo systemd destruído pelo apply*).
+  A v0.6.5 **avisa** e guarda a autópsia, mas **não corrige** — o processo continua
+  saindo do escopo. Corrigir exigiria o `apply` manter a unit viva.
 - Taxa de processo não limitado é **TCP apenas** (v0.6). UDP/QUIC mostram 0 — normal,
   não é bug. Navegador moderno usa QUIC e por isso costuma marcar 0.

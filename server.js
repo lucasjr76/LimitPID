@@ -26,7 +26,7 @@ async function startServer(o={}){
   app.get("/api/snapshot",async(_q,r)=>{try{r.json(await backend.snapshot())}catch(e){fail(r,e)}});
   app.post("/api/limit/apply",async(q,r)=>{try{const aviso=await backend.apply(q.body.pid,q.body.down,q.body.up,q.body.reset);r.json({ok:true,warning:aviso||null,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   app.post("/api/limit/change",async(q,r)=>{try{await backend.change(q.body.limiterId,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
-  app.post("/api/limit/remove",async(q,r)=>{try{await backend.remove(q.body.limiterId);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
+  app.post("/api/limit/remove",async(q,r)=>{try{const aviso=await backend.remove(q.body.limiterId);r.json({ok:true,warning:aviso||null,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   // Containers: o nome vai cru para o backend, que valida e resolve o cgroup.
   app.post("/api/cgroup/apply",async(q,r)=>{try{await backend.cgroupApply(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   app.post("/api/cgroup/change",async(q,r)=>{try{await backend.cgroupChange(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});

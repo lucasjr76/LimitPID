@@ -27,7 +27,12 @@ class Backend {
     return String(r.stderr||"").replace(/\x1b\[[0-9;]*m/g,"").trim();
   }
   async change(id,d,u){ await this.run(["change",pid(id,"limiter"),rate(d,"download"),rate(u,"upload")]); }
-  async remove(id){ await this.run(["remove",pid(id,"limiter")]); }
+  // Tambem devolve stderr: o remove avisa quando um processo NAO voltou ao
+  // cgroup original -- silenciar isso deixaria o processo orfao sem ninguem ver.
+  async remove(id){
+    const r=await this.run(["remove",pid(id,"limiter")]);
+    return String(r.stderr||"").replace(/\x1b\[[0-9;]*m/g,"").trim();
+  }
   async cgroupApply(n,d,u){ await this.run(["cgroup",cname(n),rate(d,"download"),rate(u,"upload")],15000); }
   async cgroupChange(n,d,u){ await this.run(["cgroup-change",cname(n),rate(d,"download"),rate(u,"upload")]); }
   async cgroupRemove(n){ await this.run(["cgroup-remove",cname(n)]); }

@@ -144,7 +144,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.4 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.5 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -215,9 +215,9 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.4 x 0.6.4
-OK  Marcador net-helper.api: 2-0.6.4 (esperado 2-0.6.4)
-OK  Copia do helper Python: limitpid-net-v0.6.4.py
+OK  VERSION bash x python embutido: 0.6.5 x 0.6.5
+OK  Marcador net-helper.api: 2-0.6.5 (esperado 2-0.6.5)
+OK  Copia do helper Python: limitpid-net-v0.6.5.py
 OK  app.css em dia com app.source.css
 OK  app.js: taxaDown e escapando (8 casos)
 ```
@@ -423,7 +423,7 @@ sudo limitpid cgroup NOME_DO_CONTAINER 10M 5M     # reaplica
 
 ## Quando o limite NÃO vale
 
-Três armadilhas reais. Todas foram medidas, e o software avisa nas duas primeiras.
+Quatro armadilhas reais. Todas foram medidas, e o software avisa nas três primeiras.
 
 ### 1. VM dentro de container (TAP) — **não é limitável**
 
@@ -464,7 +464,33 @@ Para checar você mesmo se um container é do tipo TAP:
 sudo docker top NOME | grep -- '-netdev tap'
 ```
 
-### 2. Cliente e servidor separados
+### 2. Limitar um app de desktop destrói o escopo systemd dele
+
+O `apply` move **todos** os processos para `/sys/fs/cgroup/limitpid/<PID>`. Se eles vinham
+de um escopo systemd, o escopo fica vazio e **o systemd coleta a unit**. No `remove` o
+destino original não existe mais e o processo cai na **raiz do cgroup** (`0::/`), fora de
+qualquer escopo — perde o vínculo com o `systemd --user`.
+
+Reproduzido de forma determinística:
+
+```bash
+systemd-run --user --scope --unit=demo.scope --collect sleep 400
+sudo limitpid apply <PID> 5M 1M                  # o escopo esvazia
+test -d /sys/fs/cgroup/.../demo.scope            # sumiu
+sudo limitpid remove <PID>
+# AVISO: 1 processo(s) NÃO voltaram ao cgroup original
+```
+
+O LimitPID **detecta e avisa** — não impede. O `remove` confere `/proc/<PID>/cgroup`
+depois de cada escrita, avisa no terminal e na GUI, e guarda o estado inteiro em
+`/run/limitpid/.trash/<pid>-<epoch>/` com um `restore.log`
+(`pid → pretendido → efetivo → situação`) em vez de apagar. O `limitpid gc` limpa depois
+de uma hora.
+
+Se isso importa para o seu caso, prefira o **modo container** (nada é movido) ou o
+`limitpid run` (o processo nasce dentro do cgroup).
+
+### 3. Cliente e servidor separados
 
 `ollama pull` rodando no host é apenas um **cliente**: ele conversa por loopback com o
 servidor dentro do container, e quem baixa da internet é o **container**. Limitar o PID
@@ -481,7 +507,7 @@ sudo limitpid cgroup ollama 10M 5M
 Vale o mesmo para `docker pull`, para gerenciadores de pacote com daemon separado, e para
 navegadores que isolam a rede em outro processo.
 
-### 3. Conexão aberta antes do limite
+### 4. Conexão aberta antes do limite
 
 Já explicado em [Sockets são carimbados na criação](#sockets-são-carimbados-na-criação).
 O `apply` avisa quantas conexões ficam de fora.
@@ -633,10 +659,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.4               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.6.5               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.4.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.6.5.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

@@ -206,7 +206,13 @@ async function submit(e){e.preventDefault();const pid=Number($('pid').value),id=
  // isso e o que evita o usuario achar que limitou e nao limitou.
  const av=(x.warning||'').split('\n').filter(l=>/limitad|conex/i.test(l)).slice(0,2).join(' ');
  toast(av?`${id?'Alterado':'Aplicado'}: ↓${d} ↑${u} — ${av}`:`${id?'Limite alterado':'Limite aplicado'}: ↓${d} ↑${u}`,!!av)}catch(e){toast(e.message,true)}}
-async function removeLimit(id){if(!confirm(`Remover limitador ${id}?`))return;try{const x=await post('/api/limit/remove',{limiterId:id});if(x.snapshot){S.snapshot=x.snapshot;render()}toast('Limitador removido.')}catch(e){toast(e.message,true)}}
+async function removeLimit(id){if(!confirm(`Remover limitador ${id}?`))return;
+ try{const x=await post('/api/limit/remove',{limiterId:id});if(x.snapshot){S.snapshot=x.snapshot;render()}
+  // Se algum processo nao voltou ao cgroup original, isso PRECISA aparecer: o
+  // processo fica orfao (fora do escopo systemd) e ninguem perceberia.
+  const av=(x.warning||'').split('\n').filter(l=>/cgroup original|autópsia|autopsia/i.test(l)).slice(0,2).join(' ');
+  toast(av?`Limitador removido — ${av}`:'Limitador removido.',!!av)}
+ catch(e){toast(e.message,true)}}
 let tt;function toast(m,err=false){const t=$('toast');t.textContent=m;t.classList.toggle('error',err);t.classList.add('show');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),3500)}
 function connect(){const proto=location.protocol==='https:'?'wss:':'ws:',ws=new WebSocket(`${proto}//${location.host}/ws`);S.ws=ws;ws.onopen=()=>{$('live').className='online';$('live').textContent='● Ao vivo'};ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type==='snapshot'){S.snapshot=m.payload;render()}else if(m.type==='error'){$('live').className='offline';$('live').textContent='● Backend com erro';toast(m.payload?.message||'Erro no backend',true)}}catch(x){console.error(x)}};ws.onclose=async()=>{$('live').className='offline';$('live').textContent='● Reconectando…';
   // Se o servidor responde mas o helper nao, o problema nao e rede.

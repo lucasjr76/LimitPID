@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 SCHEMA = 2
 RUNROOT = pathlib.Path("/run/limitpid")
 CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
