@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.1.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.3.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -80,6 +80,25 @@ não pelo cgroup atual do processo. Consequências, todas verificadas em teste:
 snapshots, com cache próprio (`sockrates`/`sockrates_time_ns`) para não colidir com
 `add_rates()`. Campo marcado `source: "tcp"`; a GUI rotula. Custo medido: **32 ms** por
 chamada, contra 750 ms de poll — 4% do ciclo. Validado com SCP real.
+
+### Armadilha do TAP — VM dentro de container (v0.6.3)
+`cgroup_skb` só enxerga **socket**. Container que roda uma VM (QEMU / `dockurr/windows`,
+`-netdev tap`) roteia o guest do `/dev/net/tun` para a bridge e sai por NAT — **sem
+socket algum**. O limite fica anexado, ativo, com inode correto, e mesmo assim o guest
+passa inteiro.
+
+Medido no `dockurr/windows` com limite de 20M:
+
+| tráfego | resultado |
+|---|---|
+| `curl` dentro do container (socket) | 75 → **19,4 Mbit/s** — limitado |
+| Windows guest (TAP) | **87 Mbit/s** — escapa |
+
+Detectado por `tun_bypass()`: algum processo do cgroup mantém `/dev/net/tun` aberto
+(0,4 ms num container de 15 processos). Vira o campo `tun_bypass` no snapshot, o badge
+**VM/TAP escapa** na GUI e o estado `TAP/VM` no `limitpid containers`.
+**Não há correção possível no eBPF de cgroup** — traffic shaping de TAP exigiria `tc`,
+que este projeto não usa.
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
@@ -160,12 +179,33 @@ Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 cam
 - Helper exige unidade na taxa (`10M`, não `10`): sem sufixo o backend leria bps puro.
 - A tabela é reconciliada por PID (nunca refeita inteira): preserva seleção e foco.
 
+## Armadilha do CSS gerado — incidente de 2026-09-02
+
+O minificador antigo (one-liner no `package.json`) descartava apenas linhas que
+**começavam** com `/*` ou `*`. O cabeçalho de `app.source.css` tem três linhas, e as
+duas últimas começam com espaço — sobreviveram. O `app.css` gerado passou a começar
+com texto solto seguido de `*/`, e o parser engoliu a regra `:root` dentro de um
+seletor inválido. **Todas as variáveis morreram**: `color:var(--text)` virou inválido,
+a cor herdada virou preto, e a tabela ficou preta sobre preto.
+
+O navegador não emite erro nenhum nesse caso — o resto da folha continua valendo.
+Diagnóstico só saiu ao medir o pixel do glifo: `#0C1217`, mais escuro que o fundo.
+
+`scripts/css.js` remove comentário de verdade (`/*…*/` em qualquer posição) e se recusa
+a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
+
 ## Restrições do ambiente
 
 - **Electron fixado em 43.2.0** (`package.json`). A partir de **43.3.0** o tray some no
   GNOME/Wayland: o `StatusNotifierItem` do Chromium passou a responder `Properties.Get`
   só pelo nome bem-conhecido, e a extensão AppIndicator consulta pelo nome único.
   Bisectado. **Não atualizar sem retestar a bandeja.**
+- Desenvolvido e medido em duas máquinas: **Zorin (GNOME/Wayland)** e **Omarchy /
+  Arch (Hyprland)**. Sob Hyprland não há bandeja de sistema por padrão — o fallback
+  sem tray cobre o caso, e `Ctrl+Q` encerra.
+- Compositor pode mentir sobre a interface: o Omarchy aplica `dim_inactive` e opacidade
+  por janela. Antes de culpar o CSS, capture com `grim` e **meça o pixel** — foi assim
+  que o incidente do CSS acima foi separado de um falso positivo de compositor.
 - **Wayland ignora `BrowserWindow.icon`**: o ícone vem do `.desktop` casado pelo `app_id`
   (`app.setName('LimitPID')` + `install-desktop.sh`).
 - Ícone de bandeja: use `assets/limitpid-mark.svg` (glyph simples). O logo completo
@@ -177,9 +217,12 @@ Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 cam
 
 - **Meça, não suponha.** Todo achado deste projeto veio de experimento controlado;
   várias hipóteses "óbvias" foram refutadas por medição.
-- `npm run check` valida as DUAS constantes VERSION e o marcador em disco — rode
-  depois de todo `install`. Foi ele que pegou o backend 0.6.1 rodando Python 0.6.0.
-- CSS: editar `public/css/app.source.css` (legível) e rodar `npm run css`.
+- `npm run check` valida as DUAS constantes VERSION, o marcador em disco, os pins de
+  dependência e a sincronia `app.source.css` → `app.css` — rode depois de todo
+  `install`. Foi ele que pegou o backend 0.6.1 rodando Python 0.6.0.
+- CSS: editar `public/css/app.source.css` (legível) e rodar `npm run css`
+  (`scripts/css.js`). **Nunca** editar `app.css` na mão — ele é gerado.
+  O `npm run check` compara os dois e reprova se estiverem fora de sincronia.
 - Versões antigas do backend ficam em `backend/versions/`; o repo tem git.
 - **Backup antes de mexer na GUI**: `tar czf backup-gui-$(date +%Y%m%d-%H%M).tgz
   public/ server.js electron.js preload.js scripts/ package.json`
@@ -195,6 +238,7 @@ Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 cam
 
 - **Upload nunca foi medido sob limite** — só download. O valor é gravado e aplicado ao
   map, mas falta teste real.
+- **VM em container não é limitável** (ver *Armadilha do TAP*). A GUI avisa; não corrige.
 - `docker compose down/up` e recriação com mesmo nome não testados (devem cair em
   `sumido` ou `morto`, mas é raciocínio, não medição).
 - Taxa de processo não limitado é **TCP apenas** (v0.6). UDP/QUIC mostram 0 — normal,

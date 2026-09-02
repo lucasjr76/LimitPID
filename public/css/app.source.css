@@ -74,6 +74,8 @@ tbody tr.click{cursor:pointer}
 .tcp{color:#9db0c5;font-size:11px}
 .tcp b{color:#6f8296;font-weight:600;font-size:9px;opacity:.6}
 .badge.dead{color:var(--red);background:rgba(255,111,125,.13);border:1px solid rgba(255,111,125,.35)}
+/* Container com VM: o limite esta ativo mas nao alcanca o trafego do guest. */
+.badge.tun{color:var(--yellow,#ffcf5c);background:rgba(255,207,92,.13);border:1px solid rgba(255,207,92,.35)}
 .icon.ctr{color:#ffcf8a;background:#2a2313}
 #containersPanel{margin-top:10px}
 .down{color:#92d1ff}

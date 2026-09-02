@@ -34,11 +34,11 @@ class Backend {
   mock(){
     const t=Date.now()/1000,w=(Math.sin(t)+1)/2,down=Math.round(8e6+w*18e6);
     return {schema:2,version:"0.4.1-mock",timestamp:new Date().toISOString(),processes:[
-      {pid:10193,user:"lucasjr",process:"firefox",tcp:13,udp:2,total_connections:15,limited:true,limiter_id:10193},
-      {pid:4216,user:"lucasjr",process:"gnome-shell",tcp:5,udp:0,total_connections:5,limited:false,limiter_id:null},
+      {pid:10193,user:"demo",process:"firefox",tcp:13,udp:2,total_connections:15,limited:true,limiter_id:10193},
+      {pid:4216,user:"demo",process:"gnome-shell",tcp:5,udp:0,total_connections:5,limited:false,limiter_id:null},
       {pid:1536,user:"root",process:"tailscaled",tcp:3,udp:1,total_connections:4,limited:false,limiter_id:null}],
-      connections:[{pid:10193,user:"lucasjr",process:"firefox",protocol:"tcp",family:"ipv4",state:"ESTABLISHED",local_ip:"192.168.110.110",local_port:34282,remote_ip:"104.18.32.47",remote_port:443,rx_queue_bytes:0,tx_queue_bytes:0,limiter_id:10193}],
-      limiters:[{id:10193,root_pid:10193,root_process:"firefox",root_user:"lucasjr",limit_down:"30M",limit_up:"5M",limit_down_bps:30000000,limit_up_bps:5000000,member_count:8,rate:{down_bps:down,up_bps:540000,down_util_percent:down/30000000*100,up_util_percent:10.8},counters:{down_allowed_bytes:412000000,down_dropped_bytes:18000000,up_allowed_bytes:14000000,up_dropped_bytes:0},connection_count:15}]};
+      connections:[{pid:10193,user:"demo",process:"firefox",protocol:"tcp",family:"ipv4",state:"ESTABLISHED",local_ip:"192.168.0.10",local_port:34282,remote_ip:"93.184.216.34",remote_port:443,rx_queue_bytes:0,tx_queue_bytes:0,limiter_id:10193}],
+      limiters:[{id:10193,root_pid:10193,root_process:"firefox",root_user:"demo",limit_down:"30M",limit_up:"5M",limit_down_bps:30000000,limit_up_bps:5000000,member_count:8,rate:{down_bps:down,up_bps:540000,down_util_percent:down/30000000*100,up_util_percent:10.8},counters:{down_allowed_bytes:412000000,down_dropped_bytes:18000000,up_allowed_bytes:14000000,up_dropped_bytes:0},connection_count:15}]};
   }
 }
 module.exports=Backend;

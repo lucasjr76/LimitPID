@@ -40,3 +40,17 @@ if(fs.existsSync(inst)){
 // A copia do helper Python no repo deve acompanhar a versao do backend.
 const copias=fs.readdirSync(path.join(raiz,"backend")).filter(f=>/^limitpid-net-v.*\.py$/.test(f));
 ok(copias.length===1,`Copia do helper Python: ${copias.join(", ")||"ausente"}`);
+
+// app.css e gerado; se ficar dessincronizado do fonte a GUI serve CSS velho.
+// Pior: um comentario mal removido ja empurrou a regra :root para dentro de um
+// seletor invalido -- todas as variaveis morreram, 'color:var(--text)' virou
+// preto e o texto sumiu no fundo preto. O navegador nao reclama disso.
+const {build,check:cssCheck}=require("./css.js");
+const cssDir=path.join(raiz,"public","css");
+const esperado=build(fs.readFileSync(path.join(cssDir,"app.source.css"),"utf8"));
+let cssOk=true,cssMsg="app.css em dia com app.source.css";
+try{ cssCheck(esperado); }catch(e){ cssOk=false; cssMsg="app.source.css: "+e.message; }
+if(cssOk && fs.readFileSync(path.join(cssDir,"app.css"),"utf8")!==esperado){
+  cssOk=false; cssMsg="app.css desatualizado -- rode 'npm run css'";
+}
+ok(cssOk,cssMsg);

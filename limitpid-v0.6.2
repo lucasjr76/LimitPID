@@ -1,0 +1,2879 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+VERSION="0.6.2"
+
+CGROOT="/sys/fs/cgroup"
+BPFROOT="/sys/fs/bpf"
+RUNROOT="/run/limitpid"
+LIBROOT="/usr/local/libexec/limitpid"
+
+LOADER="$LIBROOT/limitpid-loader"
+LOADER_SRC="$RUNROOT/limitpid-loader.c"
+LOADER_API="3"
+LOADER_API_FILE="$LIBROOT/loader.api"
+
+BPF_OBJ="$LIBROOT/limitpid.bpf.o"
+BPF_SRC="$RUNROOT/limitpid.bpf.c"
+BPF_API="2"
+BPF_API_FILE="$LIBROOT/bpf.api"
+
+NET_HELPER="$LIBROOT/limitpid-net.py"
+NET_HELPER_API="2"
+NET_HELPER_API_FILE="$LIBROOT/net-helper.api"
+
+# Cgroups preservados por "remove". Medido no kernel: programas cgroup_skb
+# filtram pelo cgroup do SOCKET (carimbado na criação), não pelo cgroup atual
+# do processo. Se o remove destruísse o cgroup, os sockets vivos ficariam
+# presos a um objeto morto e um apply seguinte nunca voltaria a limitá-los.
+# Preservando o diretório, o apply reutiliza o MESMO cgroup e o limite volta a
+# valer nas conexões em andamento, sem derrubar nada.
+DETACHED_DIR="$RUNROOT/.detached"
+DETACHED_TTL=600
+
+# Limitadores de cgroup/container. Vivem em /run (tmpfs) e os pins em bpffs:
+# ambos somem no reboot POR DESIGN -- nada aqui é persistente.
+CGRUN="$RUNROOT/cg"
+
+mkdir -p "$RUNROOT" "$LIBROOT"
+
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
+fi
+
+die()  { echo "${RED}ERRO:${RESET} $*" >&2; exit 1; }
+info() { echo "${BLUE}==>${RESET} $*"; }
+ok()   { echo "${GREEN}OK:${RESET} $*"; }
+warn() { echo "${YELLOW}AVISO:${RESET} $*" >&2; }
+
+need_root()
+{
+    [[ $EUID -eq 0 ]] || die "execute como root: sudo $0 $*"
+}
+
+# Lock global de mutação. Serializa apply/change/remove entre si e contra o
+# garbage collector, que roda a cada snapshot (~750ms quando a GUI está
+# aberta). Sem isso, o GC pode destruir um limitador no meio de um comando.
+acquire_lock()
+{
+    mkdir -p "$RUNROOT"
+    exec 9>"$RUNROOT/.lock"
+    if ! flock -w 15 9; then
+        local holder=""
+        command -v fuser >/dev/null 2>&1 &&
+            holder=$(fuser "$RUNROOT/.lock" 2>/dev/null | tr -s ' ')
+        die "outro limitpid em execução (lock ocupado${holder:+ por PID$holder}); tente novamente"
+    fi
+    LIMITPID_LOCKED=1
+}
+
+# Solta o lock explicitamente ao fim da seção crítica. Sem isso, qualquer
+# filho vivo que tenha herdado o fd 9 mantém o lock preso — caso clássico:
+# "limitpid run" segura o lock pela vida inteira do comando embrulhado.
+release_lock()
+{
+    exec 9>&- 2>/dev/null || true
+    LIMITPID_LOCKED=0
+}
+
+parse_rate()
+{
+    local v="${1^^}" n
+
+    case "$v" in
+        *K)
+            n="${v%K}"; [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000))
+            ;;
+        *M)
+            n="${v%M}"; [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000 * 1000))
+            ;;
+        *G)
+            n="${v%G}"; [[ "$n" =~ ^[0-9]+$ ]] || return 1
+            echo $((n * 1000 * 1000 * 1000))
+            ;;
+        *)
+            [[ "$v" =~ ^[0-9]+$ ]] || return 1
+            echo "$v"
+            ;;
+    esac
+}
+
+get_ppid()
+{
+    local pid="$1"
+    [[ -r "/proc/$pid/status" ]] || return 1
+    awk '/^PPid:/ {print $2; exit}' "/proc/$pid/status"
+}
+
+get_starttime()
+{
+    local pid="$1" stat rest
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    stat=$(<"/proc/$pid/stat")
+    rest="${stat##*) }"
+    set -- $rest
+    echo "${20}"
+}
+
+get_cgroup()
+{
+    local pid="$1"
+    [[ -r "/proc/$pid/cgroup" ]] || return 1
+    awk -F: '$1 == "0" {print $3; exit}' "/proc/$pid/cgroup"
+}
+
+get_comm()
+{
+    local pid="$1"
+    if [[ -r "/proc/$pid/comm" ]]; then
+        tr -d '\n' < "/proc/$pid/comm"
+    else
+        echo "?"
+    fi
+}
+
+check_environment()
+{
+    local fstype
+
+    [[ -d "$CGROOT" ]] || die "$CGROOT não existe"
+    fstype=$(stat -fc %T "$CGROOT" 2>/dev/null || true)
+    [[ "$fstype" == "cgroup2fs" ]] || die "cgroup v2 não está ativo. Encontrado: $fstype"
+
+    mkdir -p "$BPFROOT"
+    if ! grep -qsE '[[:space:]]/sys/fs/bpf[[:space:]]+bpf[[:space:]]' /proc/mounts; then
+        info "Montando bpffs em $BPFROOT"
+        mount -t bpf bpf "$BPFROOT" || die "não consegui montar bpffs"
+    fi
+
+    mkdir -p "$BPFROOT/limitpid" "$CGROOT/limitpid"
+}
+
+build_loader()
+{
+    if [[ -x "$LOADER" ]] &&
+       [[ -r "$LOADER_API_FILE" ]] &&
+       [[ "$(<"$LOADER_API_FILE")" == "$LOADER_API" ]]; then
+        return 0
+    fi
+
+    command -v gcc >/dev/null 2>&1 || die "gcc não encontrado"
+    command -v pkg-config >/dev/null 2>&1 || die "pkg-config não encontrado"
+    pkg-config --exists libbpf || die "libbpf-dev/libbpf-devel não está instalado"
+
+    info "Compilando loader eBPF v$LOADER_API..."
+
+    cat > "$LOADER_SRC" <<'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+
+struct bucket_state {
+    uint32_t lock;
+    uint32_t pad;
+    uint64_t last_ns;
+    uint64_t tokens;
+    uint64_t allowed_bytes;
+    uint64_t dropped_bytes;
+    uint64_t allowed_packets;
+    uint64_t dropped_packets;
+};
+
+struct rate_config {
+    uint64_t down_bps;
+    uint64_t up_bps;
+};
+
+static void human_bytes(uint64_t n, char *buf, size_t sz)
+{
+    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
+    double v = n;
+    int i = 0;
+    while (v >= 1000.0 && i < 4) { v /= 1000.0; i++; }
+    snprintf(buf, sz, "%.2f %s", v, u[i]);
+}
+
+static int show_stats(const char *map_path)
+{
+    int fd = bpf_obj_get(map_path);
+    uint32_t key;
+    struct bucket_state v;
+
+    if (fd < 0) {
+        fprintf(stderr, "bpf_obj_get(%s): %s\n", map_path, strerror(errno));
+        return 1;
+    }
+
+    for (key = 0; key < 2; key++) {
+        memset(&v, 0, sizeof(v));
+        if (bpf_map_lookup_elem(fd, &key, &v) != 0) {
+            fprintf(stderr, "bpf_map_lookup_elem: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+
+        char allow[64], drop[64];
+        human_bytes(v.allowed_bytes, allow, sizeof(allow));
+        human_bytes(v.dropped_bytes, drop, sizeof(drop));
+
+        printf("%s:\n", key == 0 ? "DOWNLOAD" : "UPLOAD");
+        printf("  permitido : %-14s (%llu pacotes)\n", allow,
+               (unsigned long long)v.allowed_packets);
+        printf("  descartado: %-14s (%llu pacotes)\n", drop,
+               (unsigned long long)v.dropped_packets);
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int show_raw_stats(const char *map_path)
+{
+    int fd = bpf_obj_get(map_path);
+    uint32_t key;
+    struct bucket_state v;
+
+    if (fd < 0) {
+        fprintf(stderr, "bpf_obj_get(%s): %s\n", map_path, strerror(errno));
+        return 1;
+    }
+
+    for (key = 0; key < 2; key++) {
+        memset(&v, 0, sizeof(v));
+        if (bpf_map_lookup_elem(fd, &key, &v) != 0) {
+            fprintf(stderr, "bpf_map_lookup_elem: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+
+        printf("%u %llu %llu %llu %llu\n",
+               key,
+               (unsigned long long)v.allowed_bytes,
+               (unsigned long long)v.dropped_bytes,
+               (unsigned long long)v.allowed_packets,
+               (unsigned long long)v.dropped_packets);
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int set_rate(const char *map_path, uint64_t down, uint64_t up)
+{
+    int fd = bpf_obj_get(map_path);
+    uint32_t key = 0;
+    struct rate_config cfg = { .down_bps = down, .up_bps = up };
+
+    if (fd < 0) {
+        fprintf(stderr, "bpf_obj_get(%s): %s\n", map_path, strerror(errno));
+        return 1;
+    }
+
+    if (bpf_map_update_elem(fd, &key, &cfg, BPF_ANY) != 0) {
+        fprintf(stderr, "bpf_map_update_elem(config): %s\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int load_program(const char *objfile, const char *cgpath, const char *pindir)
+{
+    struct bpf_object *obj = NULL;
+    struct bpf_program *pin = NULL, *pout = NULL;
+    struct bpf_link *lin = NULL, *lout = NULL;
+    struct bpf_map *buckets = NULL, *config = NULL;
+    char path_in[4096], path_out[4096], path_buckets[4096], path_config[4096];
+    int cgfd = -1, err = 1;
+
+    obj = bpf_object__open_file(objfile, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "bpf_object__open_file falhou\n");
+        return 1;
+    }
+
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "bpf_object__load falhou\n");
+        goto out;
+    }
+
+    pin = bpf_object__find_program_by_name(obj, "limit_ingress");
+    pout = bpf_object__find_program_by_name(obj, "limit_egress");
+    buckets = bpf_object__find_map_by_name(obj, "buckets");
+    config = bpf_object__find_map_by_name(obj, "config");
+
+    if (!pin || !pout || !buckets || !config) {
+        fprintf(stderr, "programas/maps esperados não encontrados\n");
+        goto out;
+    }
+
+    cgfd = open(cgpath, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) {
+        fprintf(stderr, "open(%s): %s\n", cgpath, strerror(errno));
+        goto out;
+    }
+
+    lin = bpf_program__attach_cgroup(pin, cgfd);
+    if (libbpf_get_error(lin)) {
+        fprintf(stderr, "attach ingress falhou\n");
+        lin = NULL;
+        goto out;
+    }
+
+    lout = bpf_program__attach_cgroup(pout, cgfd);
+    if (libbpf_get_error(lout)) {
+        fprintf(stderr, "attach egress falhou\n");
+        lout = NULL;
+        goto out;
+    }
+
+    snprintf(path_in, sizeof(path_in), "%s/ingress", pindir);
+    snprintf(path_out, sizeof(path_out), "%s/egress", pindir);
+    snprintf(path_buckets, sizeof(path_buckets), "%s/buckets", pindir);
+    snprintf(path_config, sizeof(path_config), "%s/config", pindir);
+
+    unlink(path_in); unlink(path_out); unlink(path_buckets); unlink(path_config);
+
+    if (bpf_link__pin(lin, path_in)) {
+        fprintf(stderr, "não consegui pin ingress\n");
+        goto out;
+    }
+    if (bpf_link__pin(lout, path_out)) {
+        fprintf(stderr, "não consegui pin egress\n");
+        unlink(path_in);
+        goto out;
+    }
+    if (bpf_map__pin(buckets, path_buckets)) {
+        fprintf(stderr, "não consegui pin map buckets\n");
+        unlink(path_in); unlink(path_out);
+        goto out;
+    }
+    if (bpf_map__pin(config, path_config)) {
+        fprintf(stderr, "não consegui pin map config\n");
+        unlink(path_in); unlink(path_out); unlink(path_buckets);
+        goto out;
+    }
+
+    err = 0;
+
+out:
+    if (lin) bpf_link__destroy(lin);
+    if (lout) bpf_link__destroy(lout);
+    if (cgfd >= 0) close(cgfd);
+    if (obj) bpf_object__close(obj);
+    return err;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "load") == 0) {
+        if (argc != 5) {
+            fprintf(stderr, "uso: %s load OBJ CGROUP PINDIR\n", argv[0]);
+            return 1;
+        }
+        return load_program(argv[2], argv[3], argv[4]);
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "uso: %s stats MAP\n", argv[0]);
+            return 1;
+        }
+        return show_stats(argv[2]);
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "raw-stats") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "uso: %s raw-stats MAP\n", argv[0]);
+            return 1;
+        }
+        return show_raw_stats(argv[2]);
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "set-rate") == 0) {
+        char *end = NULL;
+        uint64_t down, up;
+
+        if (argc != 5) {
+            fprintf(stderr, "uso: %s set-rate CONFIG_MAP DOWN_BPS UP_BPS\n", argv[0]);
+            return 1;
+        }
+
+        errno = 0;
+        down = strtoull(argv[3], &end, 10);
+        if (errno || !end || *end) {
+            fprintf(stderr, "DOWN_BPS inválido\n");
+            return 1;
+        }
+
+        errno = 0;
+        up = strtoull(argv[4], &end, 10);
+        if (errno || !end || *end) {
+            fprintf(stderr, "UP_BPS inválido\n");
+            return 1;
+        }
+
+        return set_rate(argv[2], down, up);
+    }
+
+    fprintf(stderr,
+            "uso:\n"
+            "  %s load OBJ CGROUP PINDIR\n"
+            "  %s stats MAP\n"
+            "  %s raw-stats MAP\n"
+            "  %s set-rate CONFIG_MAP DOWN_BPS UP_BPS\n",
+            argv[0], argv[0], argv[0], argv[0]);
+    return 1;
+}
+EOF
+
+    gcc -O2 -Wall "$LOADER_SRC" -o "$LOADER.tmp" \
+        $(pkg-config --cflags --libs libbpf) -lelf -lz \
+        || die "erro compilando loader"
+
+    chmod 700 "$LOADER.tmp"
+    mv -f "$LOADER.tmp" "$LOADER"
+    printf '%s\n' "$LOADER_API" > "$LOADER_API_FILE"
+    ok "loader compilado"
+}
+
+build_bpf()
+{
+    if [[ -s "$BPF_OBJ" ]] &&
+       [[ -r "$BPF_API_FILE" ]] &&
+       [[ "$(<"$BPF_API_FILE")" == "$BPF_API" ]]; then
+        return 0
+    fi
+
+    command -v clang >/dev/null 2>&1 || die "clang não encontrado"
+    command -v gcc >/dev/null 2>&1 || die "gcc não encontrado"
+
+    cat > "$BPF_SRC" <<'EOF'
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+#define NS_PER_SEC 1000000000ULL
+
+struct bucket_state {
+    struct bpf_spin_lock lock;
+    __u32 pad;
+    __u64 last_ns;
+    __u64 tokens;
+    __u64 allowed_bytes;
+    __u64 dropped_bytes;
+    __u64 allowed_packets;
+    __u64 dropped_packets;
+};
+
+struct rate_config {
+    __u64 down_bps;
+    __u64 up_bps;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, struct bucket_state);
+} buckets SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct rate_config);
+} config SEC(".maps");
+
+static __always_inline int enforce_rate(struct __sk_buff *skb, __u32 key)
+{
+    struct bucket_state *s;
+    struct rate_config *cfg;
+    __u32 cfg_key = 0;
+    __u64 rate_bps, now, delta, add, bytes_per_sec, burst, len;
+    int allow = 1;
+
+    cfg = bpf_map_lookup_elem(&config, &cfg_key);
+    if (!cfg)
+        return 1;
+
+    rate_bps = key == 0 ? cfg->down_bps : cfg->up_bps;
+    if (rate_bps == 0)
+        return 1;
+
+    s = bpf_map_lookup_elem(&buckets, &key);
+    if (!s)
+        return 1;
+
+    now = bpf_ktime_get_ns();
+    len = skb->len;
+    bytes_per_sec = rate_bps / 8;
+    burst = bytes_per_sec / 5; /* ~200 ms */
+    if (burst < (32ULL * 1024ULL))
+        burst = 32ULL * 1024ULL;
+
+    bpf_spin_lock(&s->lock);
+
+    if (s->last_ns == 0) {
+        s->last_ns = now;
+        s->tokens = burst;
+    } else {
+        delta = now - s->last_ns;
+        if (delta > NS_PER_SEC)
+            delta = NS_PER_SEC;
+
+        add = (delta * bytes_per_sec) / NS_PER_SEC;
+        s->tokens += add;
+        if (s->tokens > burst)
+            s->tokens = burst;
+        s->last_ns = now;
+    }
+
+    if (s->tokens >= len) {
+        s->tokens -= len;
+        s->allowed_bytes += len;
+        s->allowed_packets++;
+    } else {
+        s->dropped_bytes += len;
+        s->dropped_packets++;
+        allow = 0;
+    }
+
+    bpf_spin_unlock(&s->lock);
+    return allow;
+}
+
+SEC("cgroup_skb/ingress")
+int limit_ingress(struct __sk_buff *skb)
+{
+    return enforce_rate(skb, 0);
+}
+
+SEC("cgroup_skb/egress")
+int limit_egress(struct __sk_buff *skb)
+{
+    return enforce_rate(skb, 1);
+}
+
+char LICENSE[] SEC("license") = "GPL";
+EOF
+
+    local multiarch arch_define
+    multiarch=$(gcc -dumpmachine)
+
+    case "$(uname -m)" in
+        x86_64|i?86)   arch_define="__TARGET_ARCH_x86" ;;
+        aarch64|arm64) arch_define="__TARGET_ARCH_arm64" ;;
+        armv7*|armv6*) arch_define="__TARGET_ARCH_arm" ;;
+        *)             arch_define="__TARGET_ARCH_x86"; warn "arquitetura $(uname -m) não reconhecida" ;;
+    esac
+
+    info "Compilando eBPF genérico (uma única vez)..."
+
+    clang -O2 -g -target bpf \
+        -I"/usr/include/$multiarch" \
+        -D"$arch_define" \
+        -c "$BPF_SRC" -o "$BPF_OBJ.tmp" \
+        || { rm -f "$BPF_OBJ.tmp"; die "falha compilando eBPF"; }
+
+    [[ -s "$BPF_OBJ.tmp" ]] || die "objeto BPF não foi criado"
+    mv -f "$BPF_OBJ.tmp" "$BPF_OBJ"
+    chmod 600 "$BPF_OBJ"
+    printf '%s\n' "$BPF_API" > "$BPF_API_FILE"
+    ok "eBPF genérico compilado: $BPF_OBJ"
+}
+
+collect_process_tree()
+{
+    local root="$1" p pp changed proc pid ppid
+
+    declare -gA TARGETS=()
+    declare -gA EXCLUDE=()
+
+    # Exclui o próprio limitpid e seus ancestrais até o PID alvo.
+    p=$$
+    while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )) && [[ "$p" != "$root" ]]; do
+        EXCLUDE["$p"]=1
+        pp=$(get_ppid "$p" 2>/dev/null || echo 1)
+        [[ "$pp" =~ ^[0-9]+$ ]] || break
+        p="$pp"
+    done
+
+    TARGETS["$root"]=1
+    changed=1
+
+    while (( changed )); do
+        changed=0
+        for proc in /proc/[0-9]*; do
+            pid="${proc#/proc/}"
+            [[ "${EXCLUDE[$pid]+x}" ]] && continue
+            [[ "${TARGETS[$pid]+x}" ]] && continue
+            ppid=$(get_ppid "$pid" 2>/dev/null || true)
+            [[ -n "$ppid" ]] || continue
+
+            if [[ "${TARGETS[$ppid]+x}" ]]; then
+                TARGETS["$pid"]=1
+                changed=1
+            fi
+        done
+    done
+}
+
+
+###############################################################################
+# GARBAGE COLLECTOR DE LIMITADORES ÓRFÃOS
+#
+# Um limitador é considerado órfão somente quando:
+#
+#   - existe estado em /run/limitpid/PID
+#   - NÃO está marcado como .creating
+#   - o cgroup existe e cgroup.events informa "populated 0"
+#
+# Não usamos apenas a existência de /proc/ROOT_PID, porque o processo raiz pode
+# morrer enquanto filhos continuam vivos dentro do mesmo cgroup.
+#
+# Modo:
+#   cleanup_orphans quiet   -> não escreve nada em stdout/stderr em caso normal
+#   cleanup_orphans verbose -> informa os grupos coletados
+###############################################################################
+
+cleanup_orphans()
+{
+    local mode="${1:-quiet}"
+    local d pid state cg pin populated cleaned=0 failed=0
+
+    # Só faz sentido se já houver estrutura do LimitPID.
+    [[ -d "$RUNROOT" ]] || return 0
+    [[ -d "$CGROOT/limitpid" ]] || return 0
+
+    # GC nunca disputa: se apply/change/remove (ou outro snapshot) estiver
+    # com o lock, simplesmente pula — a próxima chamada coleta. O subshell
+    # garante que o lock é solto antes do exec do helper python.
+    if [[ "${LIMITPID_LOCKED:-0}" != "1" ]]; then
+        (
+            exec 9>"$RUNROOT/.lock"
+            flock -n 9 || exit 0
+            LIMITPID_LOCKED=1
+            cleanup_orphans "$mode"
+        )
+        return 0
+    fi
+
+    for d in "$RUNROOT"/[0-9]*; do
+        [[ -d "$d" ]] || continue
+
+        pid="${d##*/}"
+        state="$d"
+        cg="$CGROOT/limitpid/$pid"
+        pin="$BPFROOT/limitpid/$pid"
+
+        # Apply em andamento: nunca tocar.
+        [[ -e "$state/.creating" ]] && continue
+
+        # Estado sem cgroup: pode ser resíduo de uma interrupção antiga.
+        # Não apagamos automaticamente porque não temos como afirmar que seja
+        # seguro. O GC automático só coleta cgroup comprovadamente vazio.
+        [[ -d "$cg" ]] || continue
+        [[ -r "$cg/cgroup.events" ]] || continue
+
+        populated=$(
+            awk '$1 == "populated" { print $2; exit }' \
+                "$cg/cgroup.events" 2>/dev/null
+        )
+
+        [[ "$populated" == "0" ]] || continue
+
+        # Revalida imediatamente antes de remover para diminuir ainda mais a
+        # janela de corrida com algum escritor externo de cgroup.procs.
+        populated=$(
+            awk '$1 == "populated" { print $2; exit }' \
+                "$cg/cgroup.events" 2>/dev/null
+        )
+
+        [[ "$populated" == "0" ]] || continue
+
+        if [[ "$mode" == "verbose" ]]; then
+            info "Coletando limitador órfão PID/grupo $pid..."
+        fi
+
+        # O rmdir do cgroup vem PRIMEIRO: o kernel o recusa (EBUSY) se o
+        # grupo tiver qualquer processo, então ele é o teste atômico de
+        # vazio. Só depois do rmdir ter sucesso é seguro destruir os pins
+        # (links eBPF) e o estado. A ordem antiga destruía os pins antes da
+        # checagem final: se o grupo repopulasse na janela, sobrava um
+        # limitador meio-morto — cgroup e estado vivos, enforcement nenhum,
+        # e change/apply subsequentes falhando.
+        if ! rmdir "$cg" 2>/dev/null; then
+            ((failed++)) || true
+            [[ "$mode" == "verbose" ]] &&
+                warn "grupo $pid repopulou ou está ocupado; cleanup adiado"
+            continue
+        fi
+
+        # Remover pins desfaz os links eBPF e mapas persistidos.
+        rm -f \
+            "$pin/ingress" \
+            "$pin/egress" \
+            "$pin/buckets" \
+            "$pin/config" \
+            2>/dev/null || true
+
+        rmdir "$pin" 2>/dev/null || true
+
+        rm -rf "$state"
+        ((cleaned++)) || true
+
+        [[ "$mode" == "verbose" ]] &&
+            ok "limitador órfão $pid removido"
+    done
+
+    # ---------------------------------------------------------------------
+    # Cgroups preservados por "remove": coletados depois do TTL, quando não
+    # faz mais sentido religar o limite nas conexões antigas.
+    # ---------------------------------------------------------------------
+    local marker mpid agora mtime detached=0
+    if [[ -d "$DETACHED_DIR" ]]; then
+        agora=$(date +%s)
+        for marker in "$DETACHED_DIR"/[0-9]*; do
+            [[ -e "$marker" ]] || continue
+            mpid="${marker##*/}"
+            cg="$CGROOT/limitpid/$mpid"
+
+            # Foi religado por um apply (state existe de novo): não tocar.
+            if [[ -d "$RUNROOT/$mpid" ]]; then
+                rm -f "$marker" 2>/dev/null || true
+                continue
+            fi
+
+            # Cgroup já não existe: marcador é resíduo.
+            if [[ ! -d "$cg" ]]; then
+                rm -f "$marker" 2>/dev/null || true
+                continue
+            fi
+
+            mtime=$(stat -c %Y "$marker" 2>/dev/null || echo "$agora")
+            (( agora - mtime >= DETACHED_TTL )) || continue
+
+            populated=$(
+                awk '$1 == "populated" { print $2; exit }' \
+                    "$cg/cgroup.events" 2>/dev/null
+            )
+            [[ "$populated" == "0" ]] || continue
+
+            if rmdir "$cg" 2>/dev/null; then
+                rm -f "$marker" 2>/dev/null || true
+                ((detached++)) || true
+                [[ "$mode" == "verbose" ]] &&
+                    ok "cgroup preservado $mpid expirou e foi removido"
+            fi
+        done
+    fi
+
+    # ---------------------------------------------------------------------
+    # Limites de container cujo cgroup sumiu (container parado/recriado).
+    # O limite não "gruda": some junto com o container, por design.
+    # ---------------------------------------------------------------------
+    local cgdir cgslug cgpath cgmortos=0 cgzumbis=0
+    if [[ -d "$CGRUN" ]]; then
+        for cgdir in "$CGRUN"/*; do
+            [[ -d "$cgdir" ]] || continue
+            cgslug="${cgdir##*/}"
+
+            case "$(cg_estado "$cgslug")" in
+                sumido)
+                    # Container destruído: limpa tudo.
+                    rm -f "$BPFROOT/limitpid/cg-$cgslug"/{ingress,egress,buckets,config} 2>/dev/null || true
+                    rmdir "$BPFROOT/limitpid/cg-$cgslug" 2>/dev/null || true
+                    rm -rf "$cgdir"
+                    ((cgmortos++)) || true
+                    [[ "$mode" == "verbose" ]] &&
+                        ok "limite do container $cgslug removido (cgroup não existe mais)"
+                    ;;
+                morto)
+                    # Container reiniciou: o limite não vale mais. NÃO apagamos
+                    # em silêncio -- fica marcado para o usuário ver em
+                    # "list"/"containers" e decidir reaplicar.
+                    if [[ ! -e "$cgdir/.dead" ]]; then
+                        : > "$cgdir/.dead"
+                        [[ "$mode" == "verbose" ]] &&
+                            warn "limite de $cgslug MORREU (container reiniciado); reaplique"
+                    fi
+                    ((cgzumbis++)) || true
+                    ;;
+            esac
+        done
+    fi
+
+    if [[ "$mode" == "verbose" ]]; then
+        echo
+        echo "Containers expirados  : $cgmortos"
+        echo "Limites mortos        : $cgzumbis (container reiniciou; reaplique)"
+        echo "Órfãos removidos      : $cleaned"
+        echo "Falhas/adiados        : $failed"
+        echo "Preservados expirados : $detached"
+        echo
+    fi
+
+    return 0
+}
+
+cmd_gc()
+{
+    need_root "$@"
+    [[ $# -eq 0 ]] || die "uso: limitpid gc"
+
+    check_environment
+    cleanup_orphans verbose
+}
+
+# Derruba as conexões TCP ESTABLISHED dos processos já movidos para o cgroup.
+#
+# Por quê: programas cgroup_skb filtram pelo cgroup do SOCKET, carimbado na
+# criação. Mover o processo depois não re-associa conexões existentes — elas
+# escapariam do limitador para sempre (contadores zerados, limite "não
+# funciona"). Derrubá-las força o cliente a reconectar já dentro do cgroup.
+#
+# Requer ss com suporte a -K (CONFIG_INET_DIAG_DESTROY no kernel). Se não
+# houver, apenas avisa: o limite passa a valer só para conexões novas.
+# Conta conexões TCP ESTABLISHED dos processos do cgroup. Usada apenas para
+# avisar: todas elas nasceram fora deste cgroup e por isso escapam do limite.
+count_foreign_sockets()
+{
+    local cg="$1"
+    python3 - "$cg" <<'PYEOF' 2>/dev/null || echo 0
+import os, pathlib, re, sys
+cg = pathlib.Path(sys.argv[1])
+try:
+    pids = [p for p in (cg / 'cgroup.procs').read_text().split() if p.isdigit()]
+except Exception:
+    print(0); raise SystemExit
+sock_re = re.compile(r'socket:\[(\d+)\]')
+inodes = set()
+for pid in pids:
+    try:
+        fds = list((pathlib.Path('/proc') / pid / 'fd').iterdir())
+    except Exception:
+        continue
+    for fd in fds:
+        try:
+            m = sock_re.fullmatch(os.readlink(fd))
+        except Exception:
+            continue
+        if m:
+            inodes.add(m.group(1))
+n = 0
+for path in ('/proc/net/tcp', '/proc/net/tcp6'):
+    try:
+        lines = open(path).read().splitlines()[1:]
+    except Exception:
+        continue
+    for ln in lines:
+        f = ln.split()
+        if len(f) >= 10 and f[3] == '01' and f[9] in inodes:
+            n += 1
+print(n)
+PYEOF
+}
+
+reset_old_connections()
+{
+    local cg="$1" killed=0 lip lport rip rport
+
+    command -v ss >/dev/null 2>&1 || {
+        warn "ss não encontrado; conexões pré-existentes seguem SEM limite"
+        return 0
+    }
+
+    while IFS=$'\t' read -r lip lport rip rport; do
+        [[ -n "$lip" ]] || continue
+        if ss -K "src $lip sport = :$lport dst $rip dport = :$rport" >/dev/null 2>&1; then
+            ((killed++)) || true
+        fi
+    done < <(python3 - "$cg" <<'PYEOF'
+import os, pathlib, re, socket, struct, sys
+
+cg = pathlib.Path(sys.argv[1])
+try:
+    pids = [p for p in (cg / 'cgroup.procs').read_text().split() if p.isdigit()]
+except Exception:
+    sys.exit(0)
+
+sock_re = re.compile(r'socket:\[(\d+)\]')
+inodes = set()
+for pid in pids:
+    try:
+        fds = list((pathlib.Path('/proc') / pid / 'fd').iterdir())
+    except Exception:
+        continue
+    for fd in fds:
+        try:
+            m = sock_re.fullmatch(os.readlink(fd))
+        except Exception:
+            continue
+        if m:
+            inodes.add(m.group(1))
+
+def v4(h):
+    return socket.inet_ntop(socket.AF_INET, struct.pack('<I', int(h, 16)))
+
+def v6(h):
+    b = b''.join(struct.pack('<I', int(h[i:i+8], 16)) for i in range(0, 32, 8))
+    return socket.inet_ntop(socket.AF_INET6, b)
+
+for path, conv in (('/proc/net/tcp', v4), ('/proc/net/tcp6', v6)):
+    try:
+        lines = open(path).read().splitlines()[1:]
+    except Exception:
+        continue
+    for ln in lines:
+        f = ln.split()
+        # f[3] = estado (01 = ESTABLISHED), f[9] = inode
+        if len(f) < 10 or f[3] != '01' or f[9] not in inodes:
+            continue
+        try:
+            lip_h, lport_h = f[1].split(':')
+            rip_h, rport_h = f[2].split(':')
+            print('%s\t%d\t%s\t%d' % (conv(lip_h), int(lport_h, 16),
+                                      conv(rip_h), int(rport_h, 16)))
+        except Exception:
+            continue
+PYEOF
+    )
+
+    if (( killed > 0 )); then
+        info "Conexões TCP pré-existentes derrubadas: $killed (reconectarão já limitadas)"
+    fi
+
+    return 0
+}
+
+###############################################################################
+# LIMITADORES POR CGROUP (CONTAINERS)
+#
+# Diferente do modo por PID, aqui NADA é movido: o eBPF é anexado ao cgroup que
+# o Docker já criou. Como o filtro segue o cgroup do socket e os sockets do
+# container nascem nesse cgroup, o limite vale inclusive para downloads já em
+# andamento, sem derrubar conexão.
+#
+# Tudo é efêmero: estado em /run (tmpfs) e pins em bpffs somem no reboot.
+###############################################################################
+
+# Converte nome de container em caminho de cgroup, com validação estrita.
+# NUNCA aceita caminho vindo de fora: só nome, resolvido aqui dentro.
+resolve_container_cgroup()
+{
+    local nome="$1" id cg
+
+    [[ "$nome" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] ||
+        die "nome de container inválido: $nome"
+
+    command -v docker >/dev/null 2>&1 ||
+        die "docker não encontrado (necessário para resolver o container)"
+
+    id=$(docker inspect -f '{{.Id}}' "$nome" 2>/dev/null) ||
+        die "container não encontrado: $nome"
+
+    [[ "$id" =~ ^[0-9a-f]{64}$ ]] || die "ID de container inesperado para $nome"
+
+    for cg in "$CGROOT/system.slice/docker-$id.scope" "$CGROOT/docker/$id"; do
+        if [[ -d "$cg" ]]; then
+            printf '%s\n' "$cg"
+            return 0
+        fi
+    done
+
+    die "cgroup do container $nome não encontrado (container parado?)"
+}
+
+# Slug seguro para nomear diretórios de estado e pins.
+cg_slug() { printf '%s' "${1//[^A-Za-z0-9_.-]/_}"; }
+
+# Estado de um limite de container. Medido, não inferido:
+#
+#   ativo       -> cgroup existe e é o MESMO objeto de quando aplicamos
+#   morto       -> o diretório existe mas com outro inode. É o que acontece em
+#                  "docker restart": o systemd recria o scope com o mesmo NOME,
+#                  porém como objeto novo. Os programas eBPF continuam presos ao
+#                  objeto antigo e não filtram mais nada -- limite morto em
+#                  silêncio, que é justamente o que queremos denunciar.
+#   sumido      -> container destruído; o GC limpa.
+#   inexistente -> não há limite para esse nome.
+cg_estado()
+{
+    local slug="$1" state="$CGRUN/$1" cgpath ino_grav ino_atual
+
+    [[ -d "$state" ]] || { echo inexistente; return 0; }
+
+    cgpath=$(cat "$state/cgroup" 2>/dev/null || echo "")
+    [[ -n "$cgpath" && -d "$cgpath" ]] || { echo sumido; return 0; }
+
+    ino_grav=$(cat "$state/cgroup_ino" 2>/dev/null || echo "")
+    ino_atual=$(stat -c %i "$cgpath" 2>/dev/null || echo "")
+
+    if [[ -n "$ino_grav" && -n "$ino_atual" && "$ino_grav" != "$ino_atual" ]]; then
+        echo morto
+    else
+        echo ativo
+    fi
+}
+
+cmd_containers()
+{
+    need_root "$@"
+    [[ $# -eq 0 ]] || die "uso: limitpid containers"
+
+    command -v docker >/dev/null 2>&1 || die "docker não encontrado"
+
+    echo
+    printf "%-20s %-26s %-10s %-10s %-12s\n" "CONTAINER" "IMAGEM" "DOWNLOAD" "UPLOAD" "ESTADO"
+    printf "%-20s %-26s %-10s %-10s %-12s\n" "--------------------" \
+        "--------------------------" "----------" "----------" "------------"
+
+    local nome imagem slug down up est rotulo alerta=0
+    while IFS='|' read -r nome imagem; do
+        [[ -n "$nome" ]] || continue
+        slug=$(cg_slug "$nome")
+        est=$(cg_estado "$slug")
+        case "$est" in
+            ativo)  down=$(<"$CGRUN/$slug/down"); up=$(<"$CGRUN/$slug/up"); rotulo="limitado" ;;
+            morto)  down=$(<"$CGRUN/$slug/down"); up=$(<"$CGRUN/$slug/up")
+                    rotulo="${RED}MORTO${RESET}"; alerta=1 ;;
+            sumido) down="—"; up="—"; rotulo="cgroup sumiu" ;;
+            *)      down="—"; up="—"; rotulo="sem limite" ;;
+        esac
+        printf "%-20.20s %-26.26s %-10s %-10s %-12b\n" "$nome" "$imagem" "$down" "$up" "$rotulo"
+    done < <(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    echo
+
+    if (( alerta )); then
+        warn "MORTO = o container reiniciou e o limite deixou de valer."
+        warn "O tráfego está SEM limite. Reaplique com 'limitpid cgroup NOME DOWN UP'."
+        echo
+    fi
+}
+
+cmd_cgroup()
+{
+    need_root "$@"
+    [[ $# -eq 3 ]] || die "uso: limitpid cgroup CONTAINER DOWNLOAD UPLOAD"
+
+    acquire_lock
+
+    local nome="$1" down="$2" up="$3"
+    local cg slug state pin down_bps up_bps
+
+    down_bps=$(parse_rate "$down") || die "DOWNLOAD inválido: $down"
+    up_bps=$(parse_rate "$up") || die "UPLOAD inválido: $up"
+    (( down_bps > 0 )) || die "download deve ser > 0"
+    (( up_bps > 0 )) || die "upload deve ser > 0"
+
+    cg=$(resolve_container_cgroup "$nome") || exit 1
+    slug=$(cg_slug "$nome")
+    state="$CGRUN/$slug"
+    pin="$BPFROOT/limitpid/cg-$slug"
+
+    # Limite morto (restart) ou sumido: reaplica por cima em vez de recusar.
+    case "$(cg_estado "$slug")" in
+        ativo)
+            die "container $nome já possui limite. Use 'limitpid cgroup-change $nome $down $up'"
+            ;;
+        morto|sumido)
+            warn "limite anterior de $nome estava inválido (container reiniciado); reaplicando"
+            rm -f "$pin"/{ingress,egress,buckets,config} 2>/dev/null || true
+            rmdir "$pin" 2>/dev/null || true
+            rm -rf "$state"
+            ;;
+    esac
+
+    check_environment
+    build_loader
+    build_bpf
+
+    mkdir -p "$state" "$pin"
+
+    info "Anexando eBPF ao cgroup do container (nenhum processo é movido)..."
+    if ! "$LOADER" load "$BPF_OBJ" "$cg" "$pin"; then
+        rm -f "$pin"/* 2>/dev/null || true
+        rmdir "$pin" 2>/dev/null || true
+        rm -rf "$state"
+        die "não consegui anexar os programas eBPF ao cgroup $cg"
+    fi
+
+    if ! "$LOADER" set-rate "$pin/config" "$down_bps" "$up_bps"; then
+        rm -f "$pin"/* 2>/dev/null || true
+        rmdir "$pin" 2>/dev/null || true
+        rm -rf "$state"
+        die "não consegui configurar as velocidades"
+    fi
+
+    printf '%s\n' "$nome"    > "$state/name"
+    printf '%s\n' "$cg"      > "$state/cgroup"
+    # Assinatura do objeto de cgroup: se mudar, o limite morreu (ver cg_estado).
+    printf '%s\n' "$(stat -c %i "$cg" 2>/dev/null || echo 0)" > "$state/cgroup_ino"
+    printf '%s\n' "$down"    > "$state/down"
+    printf '%s\n' "$up"      > "$state/up"
+    printf '%s\n' "$down_bps" > "$state/down_bps"
+    printf '%s\n' "$up_bps"  > "$state/up_bps"
+
+    ok "container $nome limitado"
+    echo
+    echo " Container : $nome"
+    echo " Download  : $down"
+    echo " Upload    : $up"
+    echo " Cgroup    : $cg"
+    echo " Processos : $(wc -l < "$cg/cgroup.procs" 2>/dev/null || echo 0) (não foram movidos)"
+    echo
+    echo "Vale também para downloads já em andamento."
+    echo "O limite é temporário: some ao reiniciar a máquina."
+    echo
+
+    release_lock
+}
+
+cmd_cgroup_change()
+{
+    need_root "$@"
+    [[ $# -eq 3 ]] || die "uso: limitpid cgroup-change CONTAINER DOWNLOAD UPLOAD"
+
+    acquire_lock
+
+    local nome="$1" down="$2" up="$3" slug state pin down_bps up_bps
+    slug=$(cg_slug "$nome")
+    state="$CGRUN/$slug"
+    pin="$BPFROOT/limitpid/cg-$slug"
+
+    case "$(cg_estado "$slug")" in
+        inexistente) die "container $nome não possui limite ativo" ;;
+        morto)  die "limite de $nome está MORTO (container reiniciado). Reaplique: limitpid cgroup $nome $down $up" ;;
+        sumido) die "cgroup de $nome não existe mais (container removido)" ;;
+    esac
+    [[ -e "$pin/config" ]] || die "mapa de configuração ausente; refaça o limite"
+
+    down_bps=$(parse_rate "$down") || die "DOWNLOAD inválido: $down"
+    up_bps=$(parse_rate "$up") || die "UPLOAD inválido: $up"
+    (( down_bps > 0 && up_bps > 0 )) || die "valores devem ser > 0"
+
+    check_environment
+    build_loader
+
+    "$LOADER" set-rate "$pin/config" "$down_bps" "$up_bps" ||
+        die "não consegui atualizar as velocidades"
+
+    printf '%s\n' "$down" > "$state/down"
+    printf '%s\n' "$up" > "$state/up"
+    printf '%s\n' "$down_bps" > "$state/down_bps"
+    printf '%s\n' "$up_bps" > "$state/up_bps"
+
+    ok "limite do container $nome alterado para ↓$down ↑$up"
+
+    release_lock
+}
+
+cmd_cgroup_remove()
+{
+    need_root "$@"
+    [[ $# -eq 1 ]] || die "uso: limitpid cgroup-remove CONTAINER"
+
+    acquire_lock
+
+    local nome="$1" slug state pin
+    slug=$(cg_slug "$nome")
+    state="$CGRUN/$slug"
+    pin="$BPFROOT/limitpid/cg-$slug"
+
+    [[ -d "$state" ]] || die "container $nome não possui limite ativo"
+
+    # Só desanexamos: o cgroup pertence ao Docker e nunca é tocado.
+    rm -f "$pin/ingress" "$pin/egress" "$pin/buckets" "$pin/config" 2>/dev/null || true
+    rmdir "$pin" 2>/dev/null || true
+    rm -rf "$state"
+
+    ok "limite do container $nome removido (cgroup do Docker intacto)"
+
+    release_lock
+}
+
+cmd_apply()
+{
+    need_root "$@"
+
+    # --reset-connections: derruba conexões que ficariam fora do limite.
+    # Não é o padrão: derrubar mata downloads em andamento (curl sem --retry
+    # morre com "Recv failure"). Só é útil quando o socket nasceu fora de
+    # qualquer cgroup do limitpid e portanto não há como religá-lo.
+    local reset_conns=0 arg _args=()
+    for arg in "$@"; do
+        case "$arg" in
+            --reset-connections) reset_conns=1 ;;
+            --keep-connections)  reset_conns=0 ;;  # aceito por compatibilidade
+            *) _args+=("$arg") ;;
+        esac
+    done
+    set -- "${_args[@]}"
+
+    [[ $# -eq 3 ]] || die "uso: limitpid apply PID DOWNLOAD UPLOAD [--reset-connections]"
+
+    acquire_lock
+
+    local pid="$1" down="$2" up="$3"
+    local down_bps up_bps state cg pin root_cgroup reusou=0
+    local p start orig current_start current_cgroup expected_cgroup moved=0
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || die "PID inválido"
+    [[ -d "/proc/$pid" ]] || die "PID $pid não existe"
+
+    down_bps=$(parse_rate "$down") || die "DOWNLOAD inválido: $down"
+    up_bps=$(parse_rate "$up") || die "UPLOAD inválido: $up"
+    (( down_bps > 0 )) || die "download deve ser > 0"
+    (( up_bps > 0 )) || die "upload deve ser > 0"
+
+    check_environment
+    build_loader
+    build_bpf
+
+    state="$RUNROOT/$pid"
+    cg="$CGROOT/limitpid/$pid"
+    pin="$BPFROOT/limitpid/$pid"
+
+    [[ ! -d "$state" ]] || die "PID $pid já possui configuração. Use 'limitpid change $pid $down $up'."
+
+    # Cgroup preservado por um remove anterior: reutilizar o MESMO objeto faz
+    # o limite voltar a valer nas conexões que já estavam abertas.
+    if [[ -e "$DETACHED_DIR/$pid" && -d "$cg" ]]; then
+        reusou=1
+        rm -f "$DETACHED_DIR/$pid" 2>/dev/null || true
+    fi
+
+    mkdir -p "$state" "$cg" "$pin"
+
+    if (( reusou )); then
+        info "Reutilizando cgroup preservado: conexões já abertas voltam a ser limitadas"
+    fi
+
+    # Protege contra o garbage collector enquanto o cgroup ainda está vazio.
+    : > "$state/.creating"
+    rm -f "$state/.ready" 2>/dev/null || true
+
+    root_cgroup=$(get_cgroup "$pid") || {
+        rm -f "$state/.creating" 2>/dev/null || true
+        die "não consegui descobrir cgroup original"
+    }
+    printf '%s\n' "$root_cgroup" > "$state/root_cgroup"
+    printf '%s\n' "$pid" > "$state/root_pid"
+    printf '%s\n' "$down" > "$state/down"
+    printf '%s\n' "$up" > "$state/up"
+    printf '%s\n' "$down_bps" > "$state/down_bps"
+    printf '%s\n' "$up_bps" > "$state/up_bps"
+
+    collect_process_tree "$pid"
+    : > "$state/original.tsv"
+
+    info "Processos encontrados: ${#TARGETS[@]}"
+    for p in "${!TARGETS[@]}"; do
+        [[ -d "/proc/$p" ]] || continue
+        start=$(get_starttime "$p" 2>/dev/null || true)
+        orig=$(get_cgroup "$p" 2>/dev/null || true)
+        [[ -n "$start" && -n "$orig" ]] || continue
+
+        printf '%s\t%s\t%s\n' "$p" "$start" "$orig" >> "$state/original.tsv"
+        printf "  %-8s %-22s %s\n" "$p" "$(get_comm "$p")" "$orig"
+    done
+
+    info "Anexando eBPF ao cgroup..."
+    if ! "$LOADER" load "$BPF_OBJ" "$cg" "$pin"; then
+        rm -f "$pin"/* 2>/dev/null || true
+        rmdir "$pin" "$cg" 2>/dev/null || true
+        rm -f "$state/.creating" 2>/dev/null || true
+        rm -rf "$state"
+        die "não consegui anexar os programas eBPF"
+    fi
+    ok "eBPF ingress + egress anexado"
+
+    if ! "$LOADER" set-rate "$pin/config" "$down_bps" "$up_bps"; then
+        rm -f "$pin"/* 2>/dev/null || true
+        rmdir "$pin" "$cg" 2>/dev/null || true
+        rm -f "$state/.creating" 2>/dev/null || true
+        rm -rf "$state"
+        die "não consegui configurar as velocidades no map eBPF"
+    fi
+    ok "taxas configuradas dinamicamente"
+
+    info "Movendo processos para $cg..."
+    expected_cgroup="/limitpid/$pid"
+
+    while IFS=$'\t' read -r p start orig; do
+        [[ -d "/proc/$p" ]] || continue
+        current_start=$(get_starttime "$p" 2>/dev/null || true)
+        [[ "$current_start" == "$start" ]] || continue
+
+        if echo "$p" > "$cg/cgroup.procs" 2>/dev/null; then
+            sleep 0.05
+            current_cgroup=$(get_cgroup "$p" 2>/dev/null || true)
+            if [[ "$current_cgroup" == "$expected_cgroup" ]]; then
+                ((moved++)) || true
+            else
+                warn "PID $p foi movido, mas NÃO permaneceu no cgroup"
+                warn "esperado : $expected_cgroup"
+                warn "atual    : ${current_cgroup:-DESCONHECIDO}"
+            fi
+        else
+            warn "não consegui mover PID $p"
+        fi
+    done < "$state/original.tsv"
+
+    # A partir daqui o grupo está oficialmente publicado e pode ser
+    # coletado no futuro se ficar populated=0.
+    : > "$state/.ready"
+    rm -f "$state/.creating" 2>/dev/null || true
+
+    if (( reset_conns )); then
+        info "Derrubando conexões criadas antes do apply..."
+        reset_old_connections "$cg"
+    elif (( ! reusou )); then
+        # Sockets nascidos fora deste cgroup não são filtrados por ele.
+        # Avisa em vez de derrubar: o usuário decide.
+        local fora
+        fora=$(count_foreign_sockets "$cg")
+        if [[ "$fora" =~ ^[0-9]+$ ]] && (( fora > 0 )); then
+            warn "$fora conexão(ões) TCP já aberta(s) NÃO serão limitadas"
+            warn "o socket é carimbado com o cgroup em que foi criado"
+            warn "para forçar: limitpid remove $pid && limitpid apply $pid $down $up --reset-connections"
+        fi
+    fi
+
+    echo
+    echo "${BOLD}LIMITADOR ATIVO${RESET}"
+    echo
+    echo " PID raiz : $pid ($(get_comm "$pid"))"
+    echo " Download : $down"
+    echo " Upload   : $up"
+    echo " Processos: $moved"
+    echo " Cgroup   : $cg"
+    echo
+    echo " tc       : NÃO UTILIZADO"
+    echo " iptables : NÃO UTILIZADO"
+    echo " nftables : NÃO UTILIZADO"
+    echo
+
+    echo "${BOLD}Processos atualmente no cgroup:${RESET}"
+    if [[ -s "$cg/cgroup.procs" ]]; then
+        while read -r p; do
+            printf "  %-8s %s\n" "$p" "$(get_comm "$p")"
+        done < "$cg/cgroup.procs"
+    else
+        echo "  nenhum"
+    fi
+
+    echo
+    echo "Use:"
+    echo "  limitpid change $pid 10M 2M"
+    echo "  limitpid status $pid"
+    echo "  limitpid remove $pid"
+
+    release_lock
+}
+
+cmd_change()
+{
+    need_root "$@"
+    [[ $# -eq 3 ]] || die "uso: limitpid change PID DOWNLOAD UPLOAD"
+
+    acquire_lock
+    cleanup_orphans quiet
+
+    local pid="$1" down="$2" up="$3"
+    local state="$RUNROOT/$pid" pin="$BPFROOT/limitpid/$pid"
+    local down_bps up_bps
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || die "PID inválido"
+    [[ -d "$state" ]] || die "PID $pid não possui limitador registrado"
+    [[ -e "$pin/config" ]] || die "esta configuração é legado v0.1; faça remove e apply novamente"
+
+    down_bps=$(parse_rate "$down") || die "DOWNLOAD inválido: $down"
+    up_bps=$(parse_rate "$up") || die "UPLOAD inválido: $up"
+    (( down_bps > 0 )) || die "download deve ser > 0"
+    (( up_bps > 0 )) || die "upload deve ser > 0"
+
+    check_environment
+    build_loader
+
+    "$LOADER" set-rate "$pin/config" "$down_bps" "$up_bps" || die "não consegui atualizar as velocidades"
+
+    printf '%s\n' "$down" > "$state/down"
+    printf '%s\n' "$up" > "$state/up"
+    printf '%s\n' "$down_bps" > "$state/down_bps"
+    printf '%s\n' "$up_bps" > "$state/up_bps"
+
+    ok "velocidades alteradas sem recompilar, detach ou mover processos"
+    echo
+    echo " PID      : $pid ($(get_comm "$pid"))"
+    echo " Download : $down"
+    echo " Upload   : $up"
+    echo
+
+    release_lock
+}
+
+cmd_status()
+{
+    need_root "$@"
+    [[ $# -eq 1 ]] || die "uso: limitpid status PID"
+
+    cleanup_orphans quiet
+
+    local pid="$1" state="$RUNROOT/$1" cg="$CGROOT/limitpid/$1" pin="$BPFROOT/limitpid/$1"
+    local down up p count=0
+
+    [[ -d "$state" ]] || die "PID $pid não possui limitador registrado"
+    down=$(<"$state/down")
+    up=$(<"$state/up")
+
+    echo
+    echo "${BOLD}LIMITPID $VERSION${RESET}"
+    echo
+    echo " PID raiz : $pid"
+    if [[ -d "/proc/$pid" ]]; then
+        echo " Processo  : $(get_comm "$pid")"
+        echo " Estado    : executando"
+    else
+        echo " Processo  : encerrado"
+        echo " Estado    : PID raiz não existe mais"
+    fi
+
+    echo
+    echo " Download  : $down"
+    echo " Upload    : $up"
+    echo " Cgroup    : $cg"
+    echo
+    echo "${BOLD}Processos:${RESET}"
+
+    if [[ -r "$cg/cgroup.procs" ]]; then
+        while read -r p; do
+            [[ -n "$p" ]] || continue
+            ((count++)) || true
+            printf "  %-8s %s\n" "$p" "$(get_comm "$p")"
+        done < "$cg/cgroup.procs"
+    fi
+    (( count > 0 )) || echo "  nenhum"
+
+    echo
+    echo "${BOLD}eBPF:${RESET}"
+    [[ -e "$pin/ingress" ]] && echo "  ingress : ATIVO" || echo "  ingress : AUSENTE"
+    [[ -e "$pin/egress"  ]] && echo "  egress  : ATIVO" || echo "  egress  : AUSENTE"
+    [[ -e "$pin/config"  ]] && echo "  config  : DINÂMICO" || echo "  config  : LEGADO/AUSENTE"
+
+    echo
+    echo "${BOLD}Estatísticas:${RESET}"
+    if [[ -e "$pin/buckets" ]]; then
+        build_loader
+        "$LOADER" stats "$pin/buckets"
+    else
+        echo "  mapa BPF não encontrado"
+    fi
+
+    echo
+    echo "tc: nenhuma configuração é criada pelo limitpid."
+    echo
+}
+
+cmd_remove()
+{
+    need_root "$@"
+    [[ $# -eq 1 ]] || die "uso: limitpid remove PID"
+
+    acquire_lock
+
+    local pid="$1" state="$RUNROOT/$1" cg="$CGROOT/limitpid/$1" pin="$BPFROOT/limitpid/$1"
+    local root_cgroup="/" p old_start orig current_start destination remaining fallback
+
+    [[ -d "$state" ]] || die "PID $pid não possui limitador registrado"
+    [[ -r "$state/root_cgroup" ]] && root_cgroup=$(<"$state/root_cgroup")
+
+    info "Restaurando cgroups originais..."
+
+    if [[ -r "$state/original.tsv" ]]; then
+        while IFS=$'\t' read -r p old_start orig; do
+            [[ -d "/proc/$p" ]] || continue
+            current_start=$(get_starttime "$p" 2>/dev/null || true)
+            [[ "$current_start" == "$old_start" ]] || continue
+
+            destination="$CGROOT$orig"
+            [[ -d "$destination" ]] || destination="$CGROOT$root_cgroup"
+            [[ -d "$destination" ]] || destination="$CGROOT"
+
+            echo "$p" > "$destination/cgroup.procs" 2>/dev/null || warn "não consegui restaurar PID $p"
+        done < "$state/original.tsv"
+    fi
+
+    # Filhos criados depois do apply herdam o cgroup e não estão em original.tsv.
+    if [[ -r "$cg/cgroup.procs" ]]; then
+        fallback="$CGROOT$root_cgroup"
+        [[ -d "$fallback" ]] || fallback="$CGROOT"
+
+        while read -r remaining; do
+            [[ -n "$remaining" ]] || continue
+            [[ -d "/proc/$remaining" ]] || continue
+            echo "$remaining" > "$fallback/cgroup.procs" 2>/dev/null || warn "não consegui restaurar PID $remaining"
+        done < "$cg/cgroup.procs"
+    fi
+
+    info "Removendo programas e mapas eBPF..."
+    rm -f "$pin/ingress" "$pin/egress" "$pin/buckets" "$pin/config" 2>/dev/null || true
+    rmdir "$pin" 2>/dev/null || true
+
+    # O cgroup NÃO é destruído aqui de propósito: sockets ainda abertos estão
+    # presos a este objeto de cgroup. Preservá-lo permite que um apply futuro
+    # reutilize o mesmo cgroup e volte a limitar as conexões em andamento sem
+    # derrubá-las. O GC coleta o diretório depois de DETACHED_TTL segundos,
+    # quando não há mais processos nem risco de religar.
+    local cgroup_estado="destruído"
+    if [[ -d "$cg" ]]; then
+        if [[ -s "$cg/cgroup.procs" ]]; then
+            warn "processos restantes no cgroup:"
+            cat "$cg/cgroup.procs"
+            cgroup_estado="mantido (ainda populado)"
+        else
+            mkdir -p "$DETACHED_DIR"
+            : > "$DETACHED_DIR/$pid"
+            cgroup_estado="preservado ${DETACHED_TTL}s para religar sem quebrar conexões"
+        fi
+    fi
+
+    rm -rf "$state"
+
+    ok "limitador removido"
+    echo
+    echo "PID       : $pid"
+    echo "eBPF      : desanexado"
+    echo "cgroup    : $cgroup_estado"
+    echo "processos : restaurados ao cgroup original"
+    echo "tc        : não foi alterado"
+    echo "iptables  : não foi alterado"
+    echo "nftables  : não foi alterado"
+    echo
+
+    release_lock
+}
+
+cmd_run()
+{
+    need_root "$@"
+    [[ $# -ge 3 ]] || die "uso: limitpid run DOWNLOAD UPLOAD COMANDO [ARGS...]"
+
+    local down="$1" up="$2"
+    shift 2
+
+    local target_user="${SUDO_USER:-root}" uid gid home shell
+    local gate child rc
+
+    getent passwd "$target_user" >/dev/null 2>&1 || die "usuário $target_user não encontrado"
+    IFS=: read -r _ _ uid gid _ home shell < <(getent passwd "$target_user")
+    command -v setpriv >/dev/null 2>&1 || die "setpriv não encontrado (pacote util-linux)"
+
+    gate="$RUNROOT/.run-gate.$$"
+    rm -f "$gate"
+    mkfifo -m 600 "$gate" || die "não consegui criar FIFO de sincronização"
+
+    # Filho fica bloqueado antes do exec. O apply o move para o cgroup primeiro.
+    (
+        read -r _ < "$gate"
+        rm -f "$gate" 2>/dev/null || true
+        export HOME="$home" USER="$target_user" LOGNAME="$target_user"
+        exec setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$@"
+    ) &
+    child=$!
+
+    if ! cmd_apply "$child" "$down" "$up"; then
+        kill "$child" 2>/dev/null || true
+        rm -f "$gate"
+        return 1
+    fi
+
+    printf 'go\n' > "$gate"
+
+    echo
+    ok "comando liberado já dentro do cgroup"
+    echo " PID      : $child"
+    echo " Comando  : $*"
+    echo " Download : $down"
+    echo " Upload   : $up"
+    echo
+    echo "Em outro terminal: sudo limitpid status $child"
+    echo
+
+    wait "$child"
+    rc=$?
+    return "$rc"
+}
+
+human_bytes_short()
+{
+    local n="${1:-0}"
+    awk -v n="$n" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " ");
+        i=1; v=n+0;
+        while (v >= 1024 && i < 5) { v/=1024; i++ }
+        if (v >= 100)      printf "%.0f%s", v, u[i];
+        else if (v >= 10)  printf "%.1f%s", v, u[i];
+        else               printf "%.2f%s", v, u[i];
+    }'
+}
+
+human_rate_short()
+{
+    local n="${1:-0}"
+    awk -v n="$n" 'BEGIN {
+        split("B/s KiB/s MiB/s GiB/s TiB/s", u, " ");
+        i=1; v=n+0;
+        while (v >= 1024 && i < 5) { v/=1024; i++ }
+        if (v >= 100)      printf "%.0f%s", v, u[i];
+        else if (v >= 10)  printf "%.1f%s", v, u[i];
+        else               printf "%.2f%s", v, u[i];
+    }'
+}
+
+read_raw_stats()
+{
+    local pid="$1" pin="$BPFROOT/limitpid/$1" line key allow drop ap dp
+    local down_allow=0 down_drop=0 up_allow=0 up_drop=0
+
+    [[ -e "$pin/buckets" ]] || { echo "0 0 0 0"; return 0; }
+
+    while read -r key allow drop ap dp; do
+        case "$key" in
+            0) down_allow="${allow:-0}"; down_drop="${drop:-0}" ;;
+            1) up_allow="${allow:-0}";   up_drop="${drop:-0}" ;;
+        esac
+    done < <("$LOADER" raw-stats "$pin/buckets" 2>/dev/null || true)
+
+    echo "$down_allow $up_allow $down_drop $up_drop"
+}
+
+cmd_top()
+{
+    need_root "$@"
+
+    cleanup_orphans quiet
+
+    local interval="${1:-1}"
+    [[ $# -le 1 ]] || die "uso: limitpid top [INTERVALO_SEGUNDOS]"
+    [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "intervalo inválido: $interval"
+    awk -v x="$interval" 'BEGIN { exit !(x >= 0.2) }' || die "intervalo mínimo: 0.2 segundo"
+
+    [[ -t 1 ]] || die "'limitpid top' precisa de um terminal interativo"
+
+    check_environment
+    build_loader
+
+    declare -A PREV_DOWN=()
+    declare -A PREV_UP=()
+    local prev_ns now_ns elapsed_ns first=1 key="" d pid comm down up cg procs
+    local da ua dd ud pda pua dl_bps ul_bps line tmp rows=0
+
+    prev_ns=$(date +%s%N)
+
+    # Primeira fotografia dos contadores.
+    for d in "$RUNROOT"/[0-9]*; do
+        [[ -d "$d" ]] || continue
+        pid="${d##*/}"
+        read -r da ua dd ud < <(read_raw_stats "$pid")
+        PREV_DOWN["$pid"]="$da"
+        PREV_UP["$pid"]="$ua"
+    done
+
+    printf '\033[?25l'
+    trap 'printf "\033[?25h\033[0m\n"; exit 0' INT TERM HUP
+
+    while :; do
+        # Espera também captura a tecla q sem precisar de um processo extra.
+        key=""
+        IFS= read -rsn1 -t "$interval" key || true
+        [[ "$key" == "q" || "$key" == "Q" ]] && break
+
+        now_ns=$(date +%s%N)
+        elapsed_ns=$((now_ns - prev_ns))
+        (( elapsed_ns > 0 )) || elapsed_ns=1
+        prev_ns="$now_ns"
+
+        tmp=$(mktemp "$RUNROOT/.top.XXXXXX") || die "mktemp falhou"
+        rows=0
+
+        for d in "$RUNROOT"/[0-9]*; do
+            [[ -d "$d" ]] || continue
+            pid="${d##*/}"
+            down=$(cat "$d/down" 2>/dev/null || echo "?")
+            up=$(cat "$d/up" 2>/dev/null || echo "?")
+            comm=$(get_comm "$pid")
+
+            cg="$CGROOT/limitpid/$pid"
+            if [[ -r "$cg/cgroup.procs" ]]; then
+                procs=$(wc -l < "$cg/cgroup.procs" 2>/dev/null || echo 0)
+            else
+                procs=0
+            fi
+
+            read -r da ua dd ud < <(read_raw_stats "$pid")
+            pda="${PREV_DOWN[$pid]:-$da}"
+            pua="${PREV_UP[$pid]:-$ua}"
+
+            if (( da >= pda )); then
+                dl_bps=$(( (da - pda) * 1000000000 / elapsed_ns ))
+            else
+                dl_bps=0
+            fi
+            if (( ua >= pua )); then
+                ul_bps=$(( (ua - pua) * 1000000000 / elapsed_ns ))
+            else
+                ul_bps=0
+            fi
+
+            PREV_DOWN["$pid"]="$da"
+            PREV_UP["$pid"]="$ua"
+
+            # Primeiro campo é numérico e serve somente para ordenar por download atual.
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$dl_bps" "$pid" "$procs" "$comm" "$down" "$up" "$ul_bps" "$da" "$ua" "$dd" "$ud" >> "$tmp"
+            ((rows++)) || true
+        done
+
+        # Limpa tela e reposiciona cursor sem chamar clear/tput em todo ciclo.
+        printf '\033[H\033[2J'
+        printf '%sLIMITPID TOP %s%s  intervalo: %ss  ativos: %d  %s[q] sair%s\n' \
+            "$BOLD" "$VERSION" "$RESET" "$interval" "$rows" "$YELLOW" "$RESET"
+        printf 'Atualizado: %(%Y-%m-%d %H:%M:%S)T\n\n' -1
+
+        printf '%-8s %-5s %-18s %-8s %-8s %12s %12s %10s %10s %9s %9s\n' \
+            "PID" "PROCS" "PROCESSO" "DL-LIM" "UL-LIM" "DOWNLOAD" "UPLOAD" "DL-TOTAL" "UL-TOTAL" "DROP-DL" "DROP-UL"
+        printf '%-8s %-5s %-18s %-8s %-8s %12s %12s %10s %10s %9s %9s\n' \
+            "--------" "-----" "------------------" "--------" "--------" "------------" "------------" "----------" "----------" "---------" "---------"
+
+        if (( rows == 0 )); then
+            echo "Nenhum limitador ativo."
+        else
+            while IFS=$'\t' read -r dl_bps pid procs comm down up ul_bps da ua dd ud; do
+                printf '%-8s %-5s %-18.18s %-8s %-8s %12s %12s %10s %10s %9s %9s\n' \
+                    "$pid" "$procs" "$comm" "$down" "$up" \
+                    "$(human_rate_short "$dl_bps")" "$(human_rate_short "$ul_bps")" \
+                    "$(human_bytes_short "$da")" "$(human_bytes_short "$ua")" \
+                    "$(human_bytes_short "$dd")" "$(human_bytes_short "$ud")"
+            done < <(sort -nr -k1,1 "$tmp")
+        fi
+
+        rm -f "$tmp"
+        printf '\n%sDOWNLOAD/UPLOAD%s = tráfego permitido pelo eBPF no último intervalo.  DROP = total descartado.\n' "$BOLD" "$RESET"
+    done
+
+    printf '\033[?25h\033[0m\n'
+    trap - INT TERM HUP
+}
+
+build_net_helper()
+{
+    local quiet="${1:-0}"
+
+    if [[ -x "$NET_HELPER" ]] &&
+       [[ -r "$NET_HELPER_API_FILE" ]] &&
+       [[ "$(<"$NET_HELPER_API_FILE")" == "$NET_HELPER_API-$VERSION" ]]; then
+        return 0
+    fi
+
+    command -v python3 >/dev/null 2>&1 || die "python3 não encontrado (necessário para processes/connections/snapshot)"
+
+    (( quiet )) || info "Instalando helper de conexões v$NET_HELPER_API..."
+
+    cat > "$NET_HELPER.tmp" <<'PYEOF'
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import pwd
+import re
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "0.6.2"
+SCHEMA = 2
+RUNROOT = pathlib.Path("/run/limitpid")
+CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
+BPFROOT = pathlib.Path("/sys/fs/bpf/limitpid")
+LOADER = pathlib.Path("/usr/local/libexec/limitpid/limitpid-loader")
+CACHE = RUNROOT / ".snapshot-cache-v2.json"
+
+TCP_STATES = {
+    "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+    "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+    "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+    "0A": "LISTEN", "0B": "CLOSING", "0C": "NEW_SYN_RECV",
+}
+SOCKET_RE = re.compile(r"socket:\[(\d+)\]")
+
+
+def read_text(path, default=""):
+    try:
+        return pathlib.Path(path).read_text(errors="replace").strip()
+    except Exception:
+        return default
+
+
+def read_int(path, default=0):
+    try:
+        return int(read_text(path))
+    except Exception:
+        return default
+
+
+def proc_info(pid):
+    base = pathlib.Path("/proc") / str(pid)
+    comm = read_text(base / "comm", "?")
+    cmdline = ""
+    try:
+        raw = (base / "cmdline").read_bytes()
+        cmdline = raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+    except Exception:
+        pass
+    uid = None
+    try:
+        uid = base.stat().st_uid
+    except Exception:
+        pass
+    user = "?"
+    if uid is not None:
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = str(uid)
+    exe = ""
+    try:
+        exe = os.readlink(base / "exe")
+    except Exception:
+        pass
+    return {"pid": int(pid), "process": comm, "user": user, "uid": uid, "cmdline": cmdline, "exe": exe}
+
+
+def get_cgroup(pid):
+    try:
+        for line in (pathlib.Path('/proc') / str(pid) / 'cgroup').read_text().splitlines():
+            if line.startswith('0::'):
+                return line[3:]
+    except Exception:
+        pass
+    return None
+
+
+def limiter_id_for_pid(pid):
+    cg = get_cgroup(pid)
+    if not cg:
+        return None
+    m = re.fullmatch(r"/limitpid/(\d+)", cg)
+    return int(m.group(1)) if m else None
+
+
+def decode_addr(hexaddr, ipv6=False):
+    try:
+        raw = bytes.fromhex(hexaddr)
+        if ipv6:
+            raw = b"".join(raw[i:i+4][::-1] for i in range(0, 16, 4))
+            return socket.inet_ntop(socket.AF_INET6, raw)
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
+    except Exception:
+        return "?"
+
+
+def split_endpoint(value, ipv6=False):
+    addr_hex, port_hex = value.split(":", 1)
+    return decode_addr(addr_hex, ipv6), int(port_hex, 16)
+
+
+def parse_net_file(path, proto, family):
+    ipv6 = family == "ipv6"
+    rows = []
+    try:
+        lines = pathlib.Path(path).read_text().splitlines()[1:]
+    except Exception:
+        return rows
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        try:
+            local_ip, local_port = split_endpoint(parts[1], ipv6)
+            remote_ip, remote_port = split_endpoint(parts[2], ipv6)
+            state_hex = parts[3].upper()
+            uid = int(parts[7])
+            inode = int(parts[9])
+            tx_hex, rx_hex = parts[4].split(":", 1)
+            tx_queue = int(tx_hex, 16)
+            rx_queue = int(rx_hex, 16)
+        except Exception:
+            continue
+        state = TCP_STATES.get(state_hex, state_hex) if proto == "tcp" else ("CONNECTED" if remote_port else "UNCONN")
+        rows.append({
+            "inode": inode, "protocol": proto, "family": family, "state": state,
+            "local_ip": local_ip, "local_port": local_port,
+            "remote_ip": remote_ip, "remote_port": remote_port,
+            "uid_socket": uid, "tx_queue_bytes": tx_queue, "rx_queue_bytes": rx_queue,
+        })
+    return rows
+
+
+def network_rows():
+    rows = []
+    rows += parse_net_file("/proc/net/tcp", "tcp", "ipv4")
+    rows += parse_net_file("/proc/net/tcp6", "tcp", "ipv6")
+    rows += parse_net_file("/proc/net/udp", "udp", "ipv4")
+    rows += parse_net_file("/proc/net/udp6", "udp", "ipv6")
+    return rows
+
+
+def owners_by_inode(inodes):
+    owners = {i: [] for i in inodes if i}
+    if not owners:
+        return owners
+    try:
+        entries = list(pathlib.Path('/proc').iterdir())
+    except Exception:
+        return owners
+    for ent in entries:
+        if not ent.name.isdigit():
+            continue
+        pid = int(ent.name)
+        try:
+            fds = list((ent / 'fd').iterdir())
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except Exception:
+                continue
+            m = SOCKET_RE.fullmatch(target)
+            if m:
+                inode = int(m.group(1))
+                if inode in owners:
+                    owners[inode].append(pid)
+    for inode in owners:
+        owners[inode] = sorted(set(owners[inode]))
+    return owners
+
+
+def all_connections(include_all=False, only_pid=None):
+    base = network_rows()
+    inode_map = owners_by_inode({r['inode'] for r in base})
+    pinfo_cache = {}
+    out = []
+    for r in base:
+        if not include_all:
+            if r['protocol'] == 'tcp' and r['state'] in {'LISTEN', 'CLOSE', 'TIME_WAIT'}:
+                continue
+            if r['protocol'] == 'udp' and r['remote_port'] == 0:
+                continue
+        pids = inode_map.get(r['inode'], [])
+        if only_pid is not None and only_pid not in pids:
+            continue
+        # v0.4.2: órfãos de socket somem por padrão. --all os mostra para diagnóstico.
+        if not pids:
+            if include_all:
+                rr = dict(r)
+                rr.update({"pid": None, "process": "?", "user": "?", "uid": None,
+                           "cmdline": "", "exe": "", "limiter_id": None,
+                           "limiter_root_pid": None, "owned": False})
+                out.append(rr)
+            continue
+        for pid in pids:
+            if pid not in pinfo_cache:
+                pinfo_cache[pid] = proc_info(pid)
+            rr = dict(r)
+            rr.update(pinfo_cache[pid])
+            lid = limiter_id_for_pid(pid)
+            rr.update({"limiter_id": lid, "limiter_root_pid": lid, "owned": True})
+            out.append(rr)
+    out.sort(key=lambda x: (x.get('pid') is None, x.get('pid') or 0, x['protocol'], x['remote_ip'], x['remote_port'], x['local_port']))
+    return out
+
+
+def fmt_rate(bps):
+    """Formata bits/s como '30M'. Usado quando o arquivo de texto do limite nao
+    pode ser lido mas o *_bps sim -- o _bps e a fonte que o eBPF realmente usa,
+    entao derivar dele mostra a verdade em vez de um '?' na tela."""
+    try:
+        bps = int(bps)
+    except Exception:
+        return '?'
+    if bps <= 0:
+        return '?'
+    for suf, div in (('G', 10**9), ('M', 10**6), ('K', 10**3)):
+        if bps >= div and bps % div == 0:
+            return f"{bps // div}{suf}"
+    return str(bps)
+
+
+def limite_texto(state, campo):
+    """Le o limite como texto; se o arquivo faltar, deriva do *_bps."""
+    txt = read_text(state / campo, '')
+    if txt and txt != '?':
+        return txt
+    return fmt_rate(read_int(state / f'{campo}_bps', 0))
+
+
+def read_limiter(root_pid):
+    state = RUNROOT / str(root_pid)
+    pin = BPFROOT / str(root_pid)
+    cg = CGROOT / str(root_pid)
+    if not state.is_dir():
+        return None
+    members = []
+    try:
+        members = [int(x) for x in (cg / 'cgroup.procs').read_text().split() if x.isdigit()]
+    except Exception:
+        pass
+    root = proc_info(root_pid)
+    member_info = []
+    for pid in members:
+        pi = proc_info(pid)
+        pi['is_root'] = pid == root_pid
+        pi['limiter_id'] = root_pid
+        member_info.append(pi)
+    result = {
+        "id": root_pid,
+        "root_pid": root_pid,
+        "root_process": root.get('process', '?'),
+        "root_user": root.get('user', '?'),
+        "root_cmdline": root.get('cmdline', ''),
+        "limited": True,
+        "limit_down": limite_texto(state, 'down'),
+        "limit_up": limite_texto(state, 'up'),
+        "limit_down_bps": read_int(state / 'down_bps', 0),
+        "limit_up_bps": read_int(state / 'up_bps', 0),
+        "cgroup": f"/limitpid/{root_pid}",
+        "member_pids": members,
+        "members": member_info,
+        "member_count": len(members),
+        "ebpf": {
+            "ingress": (pin / 'ingress').exists(), "egress": (pin / 'egress').exists(),
+            "config": (pin / 'config').exists(), "buckets": (pin / 'buckets').exists(),
+        },
+    }
+    if (pin / 'buckets').exists() and LOADER.exists():
+        try:
+            cp = subprocess.run([str(LOADER), 'raw-stats', str(pin / 'buckets')], text=True,
+                                capture_output=True, check=True, timeout=2)
+            vals = {0: [0,0,0,0], 1: [0,0,0,0]}
+            for line in cp.stdout.splitlines():
+                p = line.split()
+                if len(p) == 5 and p[0] in {'0','1'}:
+                    vals[int(p[0])] = [int(x) for x in p[1:]]
+            result['counters'] = {
+                'down_allowed_bytes': vals[0][0], 'down_dropped_bytes': vals[0][1],
+                'down_allowed_packets': vals[0][2], 'down_dropped_packets': vals[0][3],
+                'up_allowed_bytes': vals[1][0], 'up_dropped_bytes': vals[1][1],
+                'up_allowed_packets': vals[1][2], 'up_dropped_packets': vals[1][3],
+            }
+        except Exception:
+            pass
+    return result
+
+
+CGRUN = RUNROOT / 'cg'
+
+
+def container_state(slug, cgpath, ino_saved):
+    """ativo | morto | sumido -- mesma regra do cg_estado() no bash.
+
+    'morto' = o diretorio do cgroup existe mas com outro inode: o container
+    reiniciou e os programas eBPF ficaram presos ao objeto antigo. O limite
+    NAO vale mais. Precisa chegar na GUI, senao vira mentira na tela.
+    """
+    if not cgpath or not os.path.isdir(cgpath):
+        return 'sumido'
+    try:
+        if ino_saved and int(ino_saved) != os.stat(cgpath).st_ino:
+            return 'morto'
+    except Exception:
+        pass
+    return 'ativo'
+
+
+_DOCKER_PS_CACHE = RUNROOT / '.docker-ps.json'
+_DOCKER_PS_TTL = 4.0
+
+
+def docker_ps():
+    """Containers em execucao: {nome: imagem}. Vazio se nao houver docker.
+
+    Cache curto em disco: o snapshot roda a cada 750ms e 'docker ps' e a
+    chamada mais cara do ciclo. A lista de containers muda em escala de
+    segundos, entao 4s de TTL nao atrasa nada perceptivel.
+    """
+    try:
+        st = _DOCKER_PS_CACHE.stat()
+        if time.time() - st.st_mtime < _DOCKER_PS_TTL:
+            obj = json.loads(_DOCKER_PS_CACHE.read_text())
+            if isinstance(obj, dict):
+                return obj
+    except Exception:
+        pass
+    try:
+        cp = subprocess.run(['docker', 'ps', '--format', '{{.Names}}|{{.Image}}'],
+                            text=True, capture_output=True, timeout=4)
+        if cp.returncode != 0:
+            return {}
+        out = {}
+        for ln in cp.stdout.splitlines():
+            if '|' in ln:
+                n, i = ln.split('|', 1)
+                out[n.strip()] = i.strip()
+        try:
+            tmp = _DOCKER_PS_CACHE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(out, separators=(',', ':')))
+            os.replace(tmp, _DOCKER_PS_CACHE)
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return {}
+
+
+def containers_list():
+    """Containers em execucao + estado do limite de cada um.
+
+    Precisa listar TODOS (nao so os limitados), senao a GUI nao teria como
+    oferecer o botao de limitar.
+    """
+    out = []
+    try:
+        dirs = sorted(CGRUN.iterdir())
+    except Exception:
+        dirs = []
+    old = load_cache()
+    old_c = old.get('containers', {}) if isinstance(old.get('containers', {}), dict) else {}
+    now = time.monotonic_ns()
+    # Timestamp proprio: add_rates() usa 'time_ns' e reescreve o cache inteiro.
+    old_ns = int(old.get('containers_time_ns', 0) or 0)
+    elapsed = now - old_ns if old_ns and now > old_ns else 0
+    fresh = {}
+
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        nome = read_text(d / 'name', d.name)
+        cgpath = read_text(d / 'cgroup', '')
+        estado = container_state(d.name, cgpath, read_text(d / 'cgroup_ino', ''))
+        pin = BPFROOT / f'cg-{d.name}'
+        item = {
+            'name': nome, 'slug': d.name, 'kind': 'container',
+            'state': estado, 'limited': estado == 'ativo',
+            'limit_down': limite_texto(d, 'down'),
+            'limit_up': limite_texto(d, 'up'),
+            'limit_down_bps': read_int(d / 'down_bps', 0),
+            'limit_up_bps': read_int(d / 'up_bps', 0),
+            'cgroup': cgpath,
+        }
+        da = ua = 0
+        if (pin / 'buckets').exists() and LOADER.exists():
+            try:
+                cp = subprocess.run([str(LOADER), 'raw-stats', str(pin / 'buckets')],
+                                    text=True, capture_output=True, check=True, timeout=2)
+                vals = {0: [0, 0, 0, 0], 1: [0, 0, 0, 0]}
+                for line in cp.stdout.splitlines():
+                    p = line.split()
+                    if len(p) == 5 and p[0] in {'0', '1'}:
+                        vals[int(p[0])] = [int(x) for x in p[1:]]
+                da, ua = vals[0][0], vals[1][0]
+                item['counters'] = {
+                    'down_allowed_bytes': da, 'down_dropped_bytes': vals[0][1],
+                    'up_allowed_bytes': ua, 'up_dropped_bytes': vals[1][1],
+                }
+            except Exception:
+                pass
+        prev = old_c.get(d.name, {}) if isinstance(old_c.get(d.name, {}), dict) else {}
+        down_bps = up_bps = None
+        if elapsed > 0:
+            pda = int(prev.get('down_allowed_bytes', da))
+            pua = int(prev.get('up_allowed_bytes', ua))
+            if da >= pda:
+                down_bps = (da - pda) * 8 * 1_000_000_000 / elapsed
+            if ua >= pua:
+                up_bps = (ua - pua) * 8 * 1_000_000_000 / elapsed
+        item['rate'] = {
+            'down_bps': down_bps, 'up_bps': up_bps,
+            'down_util_percent': (down_bps * 100 / item['limit_down_bps'])
+                if down_bps is not None and item['limit_down_bps'] else None,
+        }
+        fresh[d.name] = {'down_allowed_bytes': da, 'up_allowed_bytes': ua}
+        out.append(item)
+
+    # Containers em execucao que ainda nao tem limite.
+    ps = docker_ps()
+    ja = {c['name'] for c in out}
+    for nome, imagem in sorted(ps.items()):
+        if nome in ja:
+            continue
+        out.append({
+            'name': nome, 'slug': nome, 'kind': 'container', 'image': imagem,
+            'state': 'sem_limite', 'limited': False,
+            'limit_down': None, 'limit_up': None,
+            'limit_down_bps': 0, 'limit_up_bps': 0,
+            'cgroup': '', 'rate': {'down_bps': None, 'up_bps': None,
+                                   'down_util_percent': None},
+        })
+    for c in out:
+        c.setdefault('image', ps.get(c['name'], ''))
+        c['running'] = c['name'] in ps
+
+    cache = load_cache()
+    cache['containers'] = fresh
+    cache['containers_time_ns'] = now
+    save_cache(cache)
+    return out
+
+
+def limiter_map():
+    out = {}
+    try:
+        dirs = list(RUNROOT.iterdir())
+    except Exception:
+        return out
+    for d in dirs:
+        if d.is_dir() and d.name.isdigit():
+            item = read_limiter(int(d.name))
+            if item:
+                out[item['root_pid']] = item
+    return out
+
+
+def load_cache():
+    try:
+        obj = json.loads(CACHE.read_text())
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cache(obj):
+    try:
+        tmp = CACHE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(obj, separators=(',', ':')))
+        os.replace(tmp, CACHE)
+    except Exception:
+        pass
+
+
+def add_rates(limiters):
+    now = time.monotonic_ns()
+    old = load_cache()
+    old_ns = int(old.get('time_ns', 0) or 0)
+    elapsed_ns = now - old_ns if old_ns and now > old_ns else 0
+    old_lims = old.get('limiters', {}) if isinstance(old.get('limiters', {}), dict) else {}
+    # Preserva as chaves de containers: containers_list() usa o mesmo arquivo.
+    new_cache = {'time_ns': now, 'limiters': {},
+                 'containers': old.get('containers', {}),
+                 'containers_time_ns': old.get('containers_time_ns', 0),
+                 'sockrates': old.get('sockrates', {}),
+                 'sockrates_time_ns': old.get('sockrates_time_ns', 0)}
+    for root_pid, item in limiters.items():
+        c = item.get('counters', {})
+        da = int(c.get('down_allowed_bytes', 0)); ua = int(c.get('up_allowed_bytes', 0))
+        dd = int(c.get('down_dropped_bytes', 0)); ud = int(c.get('up_dropped_bytes', 0))
+        prev = old_lims.get(str(root_pid), {}) if isinstance(old_lims.get(str(root_pid), {}), dict) else {}
+        down_Bps = up_Bps = None
+        if elapsed_ns > 0:
+            pda = int(prev.get('down_allowed_bytes', da)); pua = int(prev.get('up_allowed_bytes', ua))
+            if da >= pda: down_Bps = (da-pda)*1_000_000_000/elapsed_ns
+            if ua >= pua: up_Bps = (ua-pua)*1_000_000_000/elapsed_ns
+        item['rate'] = {
+            'interval_seconds': elapsed_ns/1_000_000_000 if elapsed_ns else None,
+            'down_Bps': down_Bps, 'up_Bps': up_Bps,
+            'down_bps': down_Bps*8 if down_Bps is not None else None,
+            'up_bps': up_Bps*8 if up_Bps is not None else None,
+            'down_util_percent': (down_Bps*8*100/item['limit_down_bps']) if down_Bps is not None and item['limit_down_bps'] else None,
+            'up_util_percent': (up_Bps*8*100/item['limit_up_bps']) if up_Bps is not None and item['limit_up_bps'] else None,
+        }
+        new_cache['limiters'][str(root_pid)] = {
+            'down_allowed_bytes': da, 'up_allowed_bytes': ua,
+            'down_dropped_bytes': dd, 'up_dropped_bytes': ud,
+        }
+    save_cache(new_cache)
+    return elapsed_ns/1_000_000_000 if elapsed_ns else None
+
+
+def socket_rates():
+    """Taxa por PID de processos SEM limitador, via contadores do proprio TCP.
+
+    Processo limitado tem contador exato no eBPF. Para os demais nao existe
+    contador por processo no kernel, entao somamos bytes_received/bytes_acked
+    de cada socket TCP (tcp_info) e derivamos a taxa entre dois snapshots.
+
+    LIMITE CONHECIDO: e TCP puro. UDP e QUIC nao aparecem -- um download por
+    QUIC no navegador vai mostrar 0. Por isso vai marcado com 'source':'tcp'.
+    """
+    import re as _re
+    try:
+        cp = subprocess.run(['ss', '-tinpH', 'state', 'established'],
+                            text=True, capture_output=True, timeout=3)
+        if cp.returncode != 0:
+            return {}
+        texto = cp.stdout
+    except Exception:
+        return {}
+
+    pid_re = _re.compile(r'pid=(\d+)')
+    rx_re = _re.compile(r'bytes_received:(\d+)')
+    tx_re = _re.compile(r'bytes_acked:(\d+)')
+
+    atual = {}
+    pids_linha = []
+    for linha in texto.splitlines():
+        achou = pid_re.findall(linha)
+        if achou:
+            pids_linha = [int(p) for p in achou]
+        rx = rx_re.search(linha)
+        tx = tx_re.search(linha)
+        if (rx or tx) and pids_linha:
+            for p in pids_linha:
+                d = atual.setdefault(p, [0, 0])
+                if rx:
+                    d[0] += int(rx.group(1))
+                if tx:
+                    d[1] += int(tx.group(1))
+            pids_linha = []
+
+    old = load_cache()
+    prev = old.get('sockrates', {}) if isinstance(old.get('sockrates', {}), dict) else {}
+    now = time.monotonic_ns()
+    old_ns = int(old.get('sockrates_time_ns', 0) or 0)
+    elapsed = now - old_ns if old_ns and now > old_ns else 0
+
+    saida = {}
+    for p, (rx, tx) in atual.items():
+        d = u = None
+        if elapsed > 0:
+            ant = prev.get(str(p))
+            if isinstance(ant, list) and len(ant) == 2:
+                # Socket novo zera o acumulado: so aceita delta nao-negativo.
+                if rx >= ant[0]:
+                    d = (rx - ant[0]) * 8 * 1_000_000_000 / elapsed
+                if tx >= ant[1]:
+                    u = (tx - ant[1]) * 8 * 1_000_000_000 / elapsed
+        saida[p] = {'down_bps': d, 'up_bps': u, 'source': 'tcp'}
+
+    cache = load_cache()
+    cache['sockrates'] = {str(p): v for p, v in atual.items()}
+    cache['sockrates_time_ns'] = now
+    save_cache(cache)
+    return saida
+
+
+def process_rows(connections, limiters, sockrates=None):
+    # Lista principal = processos com rede + raiz de cada limitador.
+    # Filhos auxiliares sem sockets ficam apenas em limiters[].members/tree.
+    by_pid = {}
+    for c in connections:
+        pid = c.get('pid')
+        if pid is None:
+            continue
+        p = by_pid.setdefault(pid, {
+            **proc_info(pid), 'tcp_connections': 0, 'udp_connections': 0,
+            'connections': 0, 'limited': False, 'limiter_id': None,
+            'limiter_root_pid': None, 'is_limiter_root': False,
+            'limit_down': None, 'limit_up': None, 'limit_down_bps': None,
+            'limit_up_bps': None,
+        })
+        p['connections'] += 1
+        p['tcp_connections' if c['protocol']=='tcp' else 'udp_connections'] += 1
+        lid = c.get('limiter_id')
+        if lid is not None and lid in limiters:
+            lim = limiters[lid]
+            p.update({
+                'limited': True, 'limiter_id': lid, 'limiter_root_pid': lid,
+                'is_limiter_root': pid == lid,
+                'limit_down': lim.get('limit_down'), 'limit_up': lim.get('limit_up'),
+                'limit_down_bps': lim.get('limit_down_bps'), 'limit_up_bps': lim.get('limit_up_bps'),
+            })
+    for root_pid, lim in limiters.items():
+        p = by_pid.setdefault(root_pid, {
+            **proc_info(root_pid), 'tcp_connections': 0, 'udp_connections': 0,
+            'connections': 0, 'limited': True, 'limiter_id': root_pid,
+            'limiter_root_pid': root_pid, 'is_limiter_root': True,
+            'limit_down': lim.get('limit_down'), 'limit_up': lim.get('limit_up'),
+            'limit_down_bps': lim.get('limit_down_bps'), 'limit_up_bps': lim.get('limit_up_bps'),
+        })
+        p.update({'limited': True, 'limiter_id': root_pid, 'limiter_root_pid': root_pid,
+                  'is_limiter_root': True, 'limit_down': lim.get('limit_down'),
+                  'limit_up': lim.get('limit_up'), 'limit_down_bps': lim.get('limit_down_bps'),
+                  'limit_up_bps': lim.get('limit_up_bps')})
+    # Taxa medida no TCP para quem NAO tem limitador (limitado usa o eBPF,
+    # que e exato e ja inclui o que foi descartado).
+    if sockrates:
+        for pid_, p in by_pid.items():
+            if p.get('limited'):
+                continue
+            r = sockrates.get(pid_)
+            if r:
+                p['rate'] = {'down_bps': r['down_bps'], 'up_bps': r['up_bps'],
+                             'source': 'tcp'}
+    return sorted(by_pid.values(), key=lambda x: (not x['limited'], not x['is_limiter_root'], x['process'], x['pid']))
+
+
+def limiter_summaries(limiters, connections):
+    conn_by_lid = {}
+    for c in connections:
+        lid = c.get('limiter_id')
+        if lid is not None:
+            conn_by_lid[lid] = conn_by_lid.get(lid, 0) + 1
+    out = []
+    for root_pid, lim in sorted(limiters.items()):
+        item = dict(lim)
+        item['connection_count'] = conn_by_lid.get(root_pid, 0)
+        out.append(item)
+    return out
+
+
+def snapshot(include_all=False):
+    conns = all_connections(include_all=include_all)
+    lims = limiter_map()
+    interval = add_rates(lims)
+    procs = process_rows(conns, lims, socket_rates())
+    return {
+        'schema': SCHEMA, 'version': VERSION,
+        'timestamp': dt.datetime.now(dt.timezone.utc).astimezone().isoformat(),
+        'sample_interval_seconds': interval,
+        'processes': procs,
+        'connections': conns,
+        'limiters': limiter_summaries(lims, conns),
+        'containers': containers_list(),
+    }
+
+
+def human_endpoint(ip, port):
+    return f"[{ip}]:{port}" if ':' in ip else f"{ip}:{port}"
+
+
+def print_connections(rows):
+    print()
+    print(f"{'PID':>7} {'USER':<12} {'PROCESSO':<18} {'PROTO':<5} {'ESTADO':<12} {'LOCAL':<44} {'REMOTO':<44} {'LIM':>7} {'RXQ':>8} {'TXQ':>8}")
+    print(f"{'-------':>7} {'------------':<12} {'------------------':<18} {'-----':<5} {'------------':<12} {'--------------------------------------------':<44} {'--------------------------------------------':<44} {'-------':>7} {'--------':>8} {'--------':>8}")
+    for r in rows:
+        pid = '-' if r.get('pid') is None else str(r['pid'])
+        lim = '-' if r.get('limiter_id') is None else str(r['limiter_id'])
+        print(f"{pid:>7} {r.get('user','?')[:12]:<12} {r.get('process','?')[:18]:<18} {r['protocol'].upper():<5} {r['state'][:12]:<12} "
+              f"{human_endpoint(r['local_ip'],r['local_port'])[:44]:<44} {human_endpoint(r['remote_ip'],r['remote_port'])[:44]:<44} "
+              f"{lim:>7} {r['rx_queue_bytes']:>8} {r['tx_queue_bytes']:>8}")
+    print(f"\nConexões/sockets: {len(rows)}")
+
+
+def print_processes(rows):
+    print()
+    print(f"{'PID':>7} {'USER':<12} {'PROCESSO':<22} {'TCP':>4} {'UDP':>4} {'TOTAL':>5} {'LIMITADO':<8} {'GRUPO':>7} {'DL-LIM':>9} {'UL-LIM':>9}")
+    print(f"{'-------':>7} {'------------':<12} {'----------------------':<22} {'----':>4} {'----':>4} {'-----':>5} {'--------':<8} {'-------':>7} {'---------':>9} {'---------':>9}")
+    for p in rows:
+        group = '-' if p.get('limiter_id') is None else str(p['limiter_id'])
+        mark = 'SIM' if p['limited'] else 'não'
+        if p.get('is_limiter_root'): mark = 'RAIZ'
+        print(f"{p['pid']:>7} {p.get('user','?')[:12]:<12} {p.get('process','?')[:22]:<22} {p['tcp_connections']:>4} {p['udp_connections']:>4} {p['connections']:>5} "
+              f"{mark:<8} {group:>7} {(p.get('limit_down') or '-'):>9} {(p.get('limit_up') or '-'):>9}")
+    print(f"\nProcessos de rede/raízes de limitador: {len(rows)}")
+
+
+def print_tree(limiters):
+    print()
+    if not limiters:
+        print('Nenhum limitador ativo.')
+        return
+    for lim in limiters:
+        rate = lim.get('rate') or {}
+        d = rate.get('down_bps'); u = rate.get('up_bps')
+        ds = '-' if d is None else f"{d/1_000_000:.2f}M"
+        us = '-' if u is None else f"{u/1_000_000:.2f}M"
+        print(f"LIMITADOR {lim['root_pid']}  {lim.get('root_process','?')}  ↓{lim.get('limit_down','?')} ↑{lim.get('limit_up','?')}  atual ↓{ds} ↑{us}  conexões:{lim.get('connection_count',0)}")
+        members = lim.get('members', [])
+        if not members:
+            print('└─ (sem processos)')
+        for i, m in enumerate(members):
+            branch = '└─' if i == len(members)-1 else '├─'
+            rootmark = ' [RAIZ]' if m.get('is_root') else ''
+            print(f"{branch} {m['pid']:<7} {m.get('user','?'):<12} {m.get('process','?')}{rootmark}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('command', choices=['connections','processes','snapshot','tree'])
+    parser.add_argument('pid', nargs='?', type=int)
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--all', action='store_true')
+    args = parser.parse_args()
+
+    if args.command == 'connections':
+        rows = all_connections(include_all=args.all, only_pid=args.pid)
+        if args.json:
+            print(json.dumps({'schema':SCHEMA,'version':VERSION,'connections':rows}, ensure_ascii=False, separators=(',',':')))
+        else:
+            print_connections(rows)
+        return 0
+
+    snap = snapshot(include_all=args.all)
+    if args.command == 'processes':
+        if args.pid is not None:
+            print('processes não aceita PID', file=sys.stderr); return 2
+        if args.json:
+            print(json.dumps({'schema':SCHEMA,'version':VERSION,'timestamp':snap['timestamp'],
+                              'sample_interval_seconds':snap['sample_interval_seconds'],
+                              'processes':snap['processes']}, ensure_ascii=False, separators=(',',':')))
+        else:
+            print_processes(snap['processes'])
+        return 0
+
+    if args.command == 'tree':
+        if args.pid is not None:
+            print('tree não aceita PID', file=sys.stderr); return 2
+        if args.json:
+            print(json.dumps({'schema':SCHEMA,'version':VERSION,'timestamp':snap['timestamp'],
+                              'limiters':snap['limiters']}, ensure_ascii=False, separators=(',',':')))
+        else:
+            print_tree(snap['limiters'])
+        return 0
+
+    if args.command == 'snapshot':
+        if args.pid is not None:
+            print('snapshot não aceita PID', file=sys.stderr); return 2
+        print(json.dumps(snap, ensure_ascii=False, separators=(',',':')))
+        return 0
+    return 2
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+PYEOF
+
+    chmod 755 "$NET_HELPER.tmp"
+    mv -f "$NET_HELPER.tmp" "$NET_HELPER"
+    # Marcador inclui a VERSAO: sem isso, upgrades que nao mudam a API
+    # deixavam o python antigo em disco (foi o bug do "GUI mostra v0.4.1").
+    printf '%s\n' "$NET_HELPER_API-$VERSION" > "$NET_HELPER_API_FILE"
+    (( quiet )) || ok "helper de conexões instalado"
+}
+
+cmd_connections()
+{
+    need_root "$@"
+
+    cleanup_orphans quiet
+
+    local json=0 all=0 pid="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json=1 ;;
+            --all)  all=1 ;;
+            *)
+                if [[ -z "$pid" && "$arg" =~ ^[0-9]+$ ]]; then
+                    pid="$arg"
+                else
+                    die "uso: limitpid connections [PID] [--json] [--all]"
+                fi
+                ;;
+        esac
+    done
+
+    build_net_helper "$json"
+
+    local args=(connections)
+    [[ -n "$pid" ]] && args+=("$pid")
+    (( json )) && args+=(--json)
+    (( all )) && args+=(--all)
+
+    exec "$NET_HELPER" "${args[@]}"
+}
+
+cmd_processes()
+{
+    need_root "$@"
+
+    cleanup_orphans quiet
+
+    local json=0 all=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json=1 ;;
+            --all)  all=1 ;;
+            *) die "uso: limitpid processes [--json] [--all]" ;;
+        esac
+    done
+
+    # Snapshot de processos limitados usa os contadores do loader.
+    if (( json )); then
+        build_loader >/dev/null
+    else
+        build_loader
+    fi
+    build_net_helper "$json"
+
+    local args=(processes)
+    (( json )) && args+=(--json)
+    (( all )) && args+=(--all)
+    exec "$NET_HELPER" "${args[@]}"
+}
+
+cmd_snapshot()
+{
+    need_root "$@"
+
+    # Principal gatilho do GC na GUI. "quiet" é obrigatório:
+    # stdout de snapshot precisa continuar sendo JSON puro.
+    cleanup_orphans quiet
+
+    local all=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) : ;; # aceito por ergonomia; snapshot já é JSON.
+            --all) all=1 ;;
+            *) die "uso: limitpid snapshot [--json] [--all]" ;;
+        esac
+    done
+
+    # stdout deve conter SOMENTE JSON para a GUI.
+    build_loader >/dev/null
+    build_net_helper 1
+
+    local args=(snapshot)
+    (( all )) && args+=(--all)
+    exec "$NET_HELPER" "${args[@]}"
+}
+
+cmd_json()
+{
+    cmd_snapshot --json "$@"
+}
+
+cmd_tree()
+{
+    need_root "$@"
+
+    cleanup_orphans quiet
+
+    local json=0 all=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json=1 ;;
+            --all)  all=1 ;;
+            *) die "uso: limitpid tree [--json] [--all]" ;;
+        esac
+    done
+
+    if (( json )); then
+        build_loader >/dev/null
+    else
+        build_loader
+    fi
+    build_net_helper "$json"
+
+    local args=(tree)
+    (( json )) && args+=(--json)
+    (( all )) && args+=(--all)
+    exec "$NET_HELPER" "${args[@]}"
+}
+
+cmd_list()
+{
+    need_root "$@"
+
+    cleanup_orphans quiet
+
+    echo
+    printf "%-10s %-22s %-12s %-12s\n" "PID" "PROCESSO" "DOWNLOAD" "UPLOAD"
+    printf "%-10s %-22s %-12s %-12s\n" "----------" "----------------------" "------------" "------------"
+
+    local d pid down up
+    for d in "$RUNROOT"/[0-9]*; do
+        [[ -d "$d" ]] || continue
+        pid="${d##*/}"
+        down=$(cat "$d/down" 2>/dev/null || echo "?")
+        up=$(cat "$d/up" 2>/dev/null || echo "?")
+        printf "%-10s %-22s %-12s %-12s\n" "$pid" "$(get_comm "$pid")" "$down" "$up"
+    done
+
+    local cgdir nome
+    if [[ -d "$CGRUN" ]] && compgen -G "$CGRUN/*" >/dev/null; then
+        echo
+        printf "%-10s %-22s %-12s %-12s\n" "CONTAINER" "" "DOWNLOAD" "UPLOAD"
+        printf "%-10s %-22s %-12s %-12s\n" "----------" "----------------------" "------------" "------------"
+        for cgdir in "$CGRUN"/*; do
+            [[ -d "$cgdir" ]] || continue
+            nome=$(cat "$cgdir/name" 2>/dev/null || echo "${cgdir##*/}")
+            local marca=""
+            [[ "$(cg_estado "${cgdir##*/}")" == "morto" ]] && marca="  ${RED}<< MORTO: reaplique${RESET}"
+            printf "%-10s %-22.22s %-12s %-12s%b\n" "cgroup" "$nome" \
+                "$(cat "$cgdir/down" 2>/dev/null || echo '?')" \
+                "$(cat "$cgdir/up" 2>/dev/null || echo '?')" "$marca"
+        done
+    fi
+    echo
+}
+
+usage()
+{
+    cat <<EOF
+
+limitpid $VERSION
+
+Limitação de banda por PID usando cgroup v2 + eBPF.
+Sem tc, iptables ou nftables.
+
+USO:
+    limitpid PID DOWNLOAD UPLOAD
+    limitpid apply PID DOWNLOAD UPLOAD [--reset-connections]
+    limitpid change PID DOWNLOAD UPLOAD
+    limitpid status PID
+    limitpid remove PID
+    limitpid run DOWNLOAD UPLOAD COMANDO [ARGS...]
+
+    limitpid containers                              # lista containers Docker
+    limitpid cgroup CONTAINER DOWNLOAD UPLOAD        # limita um container
+    limitpid cgroup-change CONTAINER DOWNLOAD UPLOAD
+    limitpid cgroup-remove CONTAINER
+
+    limitpid list
+    limitpid gc
+    limitpid top [INTERVALO_SEGUNDOS]
+    limitpid processes [--json] [--all]
+    limitpid tree [--json] [--all]
+    limitpid connections [PID] [--json] [--all]
+    limitpid snapshot [--json] [--all]
+    limitpid json [--all]
+
+EXEMPLOS:
+    sudo limitpid 12345 10M 2M
+    sudo limitpid apply 12345 10M 2M
+    sudo limitpid change 12345 20M 5M
+    sudo limitpid run 10M 2M firefox
+    sudo limitpid run 5M 1M curl -o /dev/null https://fsn1-speed.hetzner.com/100MB.bin
+    sudo limitpid status 12345
+    sudo limitpid remove 12345
+    sudo limitpid top
+    sudo limitpid top 0.5
+    sudo limitpid processes
+    sudo limitpid tree
+    sudo limitpid connections
+    sudo limitpid connections 12345
+    sudo limitpid connections --json
+    sudo limitpid snapshot --json
+
+UNIDADES:
+    K = kbit/s
+    M = Mbit/s
+    G = Gbit/s
+
+OBJETO BPF GENÉRICO:
+    $BPF_OBJ
+
+O objeto é compilado uma vez. "change" altera apenas o BPF map de configuração,
+sem recompilar, sem detach e sem mover processos.
+
+BACKEND PARA GUI (v0.4.3):
+    processes   lista processos de rede e raízes de limitador, sem duplicar filhos auxiliares
+    connections lista conexões/sockets IPv4/IPv6 e seus PIDs
+    tree        mostra cada limitador como grupo e seus processos membros
+    snapshot    entrega JSON estável (schema 2) e coleta limitadores órfãos
+    gc          força uma varredura manual de limitadores órfãos
+
+Por padrão LISTEN/TIME_WAIT, UDP sem peer e sockets órfãos são ocultados. Use --all para incluí-los.
+
+GARBAGE COLLECTOR (v0.4.3):
+    - grupos em criação são protegidos por .creating
+    - cgroup populated=1 nunca é removido, mesmo se o PID raiz morrer
+    - cgroup populated=0 é coletado automaticamente no próximo snapshot/comando
+    - remoção segura: rmdir do cgroup (teste atômico) antes de destruir pins/estado
+    - serializado por lock (flock) com apply/change/remove
+    - não há daemon residente adicional
+
+NOVIDADES v0.5.0 -- CONTAINERS:
+    Downloads de containers (ollama, docker pull, etc.) NÃO são limitáveis pelo
+    PID que aparece no host: o cliente só conversa por loopback e quem baixa é o
+    processo dentro do container. Use o modo cgroup:
+
+        sudo limitpid containers
+        sudo limitpid cgroup ollama 2M 1M
+        sudo limitpid cgroup-change ollama 10M 2M
+        sudo limitpid cgroup-remove ollama
+
+    Nesse modo nenhum processo é movido: o eBPF é anexado ao cgroup que o Docker
+    já criou. Vale inclusive para downloads em andamento, sem derrubar conexão.
+
+    NADA É PERSISTENTE. Estado em /run (tmpfs) e pins em bpffs somem ao reiniciar
+    a máquina. Container parado ou recriado perde o limite (o GC limpa o resíduo).
+
+COMO O FILTRO ESCOLHE O TRÁFEGO (medido, não suposto):
+    Programas cgroup_skb filtram pelo cgroup do SOCKET, carimbado quando o
+    socket é criado -- não pelo cgroup atual do processo. Consequências:
+
+      - conexão aberta ANTES do primeiro apply nunca é limitada (o socket
+        nasceu fora); apply avisa quantas são. Use --reset-connections para
+        derrubá-las e deixar o cliente reconectar já limitado.
+      - remove NÃO destrói o cgroup: os sockets vivos continuam presos a ele.
+        Um apply seguinte reutiliza o mesmo cgroup e o limite volta a valer
+        nas conexões em andamento, sem derrubar nada.
+      - change nunca derruba nada: só atualiza o BPF map.
+
+NOVIDADES v0.4.4:
+    - remove preserva o cgroup por DETACHED_TTL (${DETACHED_TTL}s); apply o
+      reutiliza e religa o limite sem quebrar downloads em andamento
+    - apply não derruba mais conexões por padrão: apenas avisa
+      (--reset-connections força o comportamento antigo)
+    - GC coleta os cgroups preservados após o TTL
+
+NOVIDADES v0.4.3:
+    - lock global com liberação explícita (run não segura mais o lock)
+    - GC remove na ordem segura (rmdir do cgroup antes dos pins)
+    - helper python re-extraído automaticamente a cada nova versão
+
+Nesta versão a limitação continua sendo por processo/cgroup. O controle individual
+por socket/conexão fica reservado para a próxima etapa, sem quebrar a API JSON.
+
+EOF
+}
+
+case "${1:-}" in
+    apply)  shift; cmd_apply "$@" ;;
+    change) shift; cmd_change "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
+    run)    shift; cmd_run "$@" ;;
+    list)           shift; cmd_list "$@" ;;
+    containers)     shift; cmd_containers "$@" ;;
+    cgroup)         shift; cmd_cgroup "$@" ;;
+    cgroup-change)  shift; cmd_cgroup_change "$@" ;;
+    cgroup-remove)  shift; cmd_cgroup_remove "$@" ;;
+    gc)          shift; cmd_gc "$@" ;;
+    top)         shift; cmd_top "$@" ;;
+    processes)   shift; cmd_processes "$@" ;;
+    tree)        shift; cmd_tree "$@" ;;
+    connections) shift; cmd_connections "$@" ;;
+    snapshot)    shift; cmd_snapshot "$@" ;;
+    json)        shift; cmd_json "$@" ;;
+    -h|--help|help|"") usage ;;
+    *)
+        if [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ $# -eq 3 ]]; then
+            cmd_apply "$@"
+        else
+            die "comando desconhecido: $1"
+        fi
+        ;;
+esac

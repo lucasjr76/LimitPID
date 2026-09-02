@@ -6,6 +6,13 @@ function esc(v){return String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt
 function limiter(id){return id==null?null:(S.snapshot?.limiters||[]).find(x=>Number(x.id)===Number(id))||null}
 function conns(pid){return (S.snapshot?.connections||[]).filter(x=>Number(x.pid)===Number(pid))}
 function proc(p){const cs=conns(p.pid),l=limiter(p.limiter_id);return {...p,limiter:l,tcp:num(p.tcp)||cs.filter(c=>String(c.protocol).toLowerCase()==="tcp").length,udp:num(p.udp)||cs.filter(c=>String(c.protocol).toLowerCase()==="udp").length,total_connections:num(p.total_connections)||cs.length}}
+// '?' significa que o backend nao conseguiu ler o arquivo de texto do limite.
+// O *_bps e a fonte que o eBPF usa de fato, entao derivamos dele em vez de
+// mostrar '?' -- limite existe e a tela precisa dizer qual e.
+function fmtRate(bps){bps=num(bps);if(bps<=0)return null;
+  for(const [s,d] of [['G',1e9],['M',1e6],['K',1e3]])if(bps>=d&&bps%d===0)return (bps/d)+s;
+  return String(bps)}
+function limTexto(txt,bps){return (txt&&txt!=='?')?txt:(fmtRate(bps)||'—')}
 function initial(n){return (String(n||"?").replace(/[^a-z0-9]/gi,"").slice(0,2)||"?").toUpperCase()}
 // Ordenacao das colunas. Sem coluna escolhida vale a ordem padrao: quem tem
 // mais banda limitada primeiro, depois quem tem mais conexoes.
@@ -67,8 +74,8 @@ function linhaHTML(p){
   const l=p.limiter,c=celulasVolateis(p);
   return `<td><div class="proc"><div class="icon">${esc(initial(p.process))}</div><div><strong>${esc(p.process||'?')}</strong><small>${esc(p.user||'?')}</small></div></div></td>`+
     `<td>${p.pid}</td><td>${c.conns}</td><td class="down">${c.down}</td><td class="up">${c.up}</td>`+
-    `<td>${l?`<span class="badge limit">${esc(l.limit_down||'—')}</span>`:'∞'}</td>`+
-    `<td>${l?`<span class="badge limit">${esc(l.limit_up||'—')}</span>`:'∞'}</td>`+
+    `<td>${l?`<span class="badge limit">${esc(limTexto(l.limit_down,l.limit_down_bps))}</span>`:'∞'}</td>`+
+    `<td>${l?`<span class="badge limit">${esc(limTexto(l.limit_up,l.limit_up_bps))}</span>`:'∞'}</td>`+
     `<td>${c.util}</td>`+
     `<td><button class="tiny" data-limit="${p.pid}">${l?'Alterar':'Limitar'}</button></td>`;
 }
@@ -133,13 +140,17 @@ function renderContainers(){
     const r=c.rate||{},d=num(r.down_bps),util=Math.min(100,Math.max(0,num(r.down_util_percent)));
     const morto=c.state==='morto', ativo=c.state==='ativo';
     const nome=esc(c.name);
+    // TAP: o container roteia pacotes de uma VM por /dev/net/tun. cgroup_skb so
+    // ve socket, entao esse trafego escapa do limite inteiro. Dizer so
+    // "limitado" aqui seria mentira -- e falha silenciosa e o pior defeito
+    // possivel neste projeto.
     const est=morto?'<span class="badge dead">MORTO — reaplique</span>'
-      :ativo?'<span class="badge limit">limitado</span>':'';
+      :ativo?('<span class="badge limit">limitado</span>'+(c.tun_bypass?' <span class="badge tun" title="O container roteia uma VM por /dev/net/tun. Esse tráfego não passa por socket, então o eBPF não o alcança: o limite vale para os sockets do container, não para o guest.">VM/TAP escapa</span>':'')):'';
     return `<tr data-cname="${nome}"><td><div class="proc"><div class="icon ctr">${esc(initial(c.name))}</div><div><strong>${nome}</strong> ${est}</div></div></td>`+
       `<td><small style="color:var(--muted)">${esc((c.image||'').slice(0,28))}</small></td>`+
       `<td class="down">${ativo?bits(d):'—'}</td>`+
-      `<td>${c.limit_down?`<span class="badge limit">${esc(c.limit_down)}</span>`:'∞'}</td>`+
-      `<td>${c.limit_up?`<span class="badge limit">${esc(c.limit_up)}</span>`:'∞'}</td>`+
+      `<td>${c.limit_down?`<span class="badge limit">${esc(limTexto(c.limit_down,c.limit_down_bps))}</span>`:'∞'}</td>`+
+      `<td>${c.limit_up?`<span class="badge limit">${esc(limTexto(c.limit_up,c.limit_up_bps))}</span>`:'∞'}</td>`+
       `<td>${ativo?`<div class="util"><div class="ut"><span>${util.toFixed(1)}%</span><span>${bits(d)}</span></div><div class="bar"><i style="width:${util}%"></i></div></div>`:'<span style="color:var(--muted)">sem limite</span>'}</td>`+
       `<td><button class="tiny" data-climit="${nome}">${ativo?'Alterar':morto?'Reaplicar':'Limitar'}</button>`+
       (ativo||morto?` <button class="tiny" data-cdel="${nome}">×</button>`:'')+`</td></tr>`;
@@ -164,7 +175,7 @@ async function removeContainerLimit(name){
 function endpoint(ip,port){ip=String(ip||'?');if(ip.includes(':')&&!ip.startsWith('['))ip=`[${ip}]`;return `${ip}:${port??'?'}`}
 function openDrawer(pid){S.pid=pid;renderDrawer();$('drawer').classList.add('open');$('backdrop').classList.add('open')}
 function closeDrawer(){S.pid=null;$('drawer').classList.remove('open');$('backdrop').classList.remove('open')}
-function renderDrawer(){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(S.pid));if(!raw)return closeDrawer();const p=proc(raw),l=p.limiter,cs=conns(p.pid);$('drawerTitle').textContent=p.process||'?';$('drawerSub').textContent=`PID ${p.pid} · ${p.user||'?'}`;$('drawerBody').innerHTML=`<section class="section"><h3>Tráfego e limite</h3><div class="grid"><div class="box"><span>Download atual</span><strong>${l?bits(l.rate?.down_bps):(p.rate?.down_bps!=null?bits(p.rate.down_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Upload atual</span><strong>${l?bits(l.rate?.up_bps):(p.rate?.up_bps!=null?bits(p.rate.up_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Limite download</span><strong>${l?esc(l.limit_down):'Ilimitado'}</strong></div><div class="box"><span>Limite upload</span><strong>${l?esc(l.limit_up):'Ilimitado'}</strong></div></div><div class="btnrow"><button class="primary" id="drawerLimit">${l?'Alterar limites':'Aplicar limite'}</button>${l?'<button class="danger" id="drawerRemove">Remover limite</button>':''}</div></section>${l?`<section class="section"><h3>eBPF / cgroup</h3><div class="grid"><div class="box"><span>Limiter ID</span><strong>${l.id}</strong></div><div class="box"><span>Membros</span><strong>${l.member_count??'—'}</strong></div><div class="box"><span>Permitido ↓</span><strong>${bytes(l.counters?.down_allowed_bytes)}</strong></div><div class="box"><span>Descartado ↓</span><strong>${bytes(l.counters?.down_dropped_bytes)}</strong></div></div></section>`:''}<section class="section"><h3>Conexões (${cs.length})</h3>${cs.length?cs.map(c=>`<div class="conn"><div class="row"><strong>${esc(String(c.protocol||'?').toUpperCase())} · ${esc(c.state||'?')}</strong><small>${esc(c.family||'')}</small></div><div style="margin-top:7px"><code>${esc(endpoint(c.local_ip,c.local_port))}</code></div><div style="color:var(--muted);font-size:11px;margin:2px 0">↓</div><div><code>${esc(endpoint(c.remote_ip,c.remote_port))}</code></div><div class="row" style="margin-top:8px"><small>RXQ ${bytes(c.rx_queue_bytes)}</small><small>TXQ ${bytes(c.tx_queue_bytes)}</small></div></div>`).join(''):'<div class="empty">Nenhuma conexão ativa.</div>'}</section>`;$('drawerLimit').onclick=()=>openDialog(p.pid);if($('drawerRemove'))$('drawerRemove').onclick=()=>removeLimit(l.id)}
+function renderDrawer(){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(S.pid));if(!raw)return closeDrawer();const p=proc(raw),l=p.limiter,cs=conns(p.pid);$('drawerTitle').textContent=p.process||'?';$('drawerSub').textContent=`PID ${p.pid} · ${p.user||'?'}`;$('drawerBody').innerHTML=`<section class="section"><h3>Tráfego e limite</h3><div class="grid"><div class="box"><span>Download atual</span><strong>${l?bits(l.rate?.down_bps):(p.rate?.down_bps!=null?bits(p.rate.down_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Upload atual</span><strong>${l?bits(l.rate?.up_bps):(p.rate?.up_bps!=null?bits(p.rate.up_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Limite download</span><strong>${l?esc(limTexto(l.limit_down,l.limit_down_bps)):'Ilimitado'}</strong></div><div class="box"><span>Limite upload</span><strong>${l?esc(limTexto(l.limit_up,l.limit_up_bps)):'Ilimitado'}</strong></div></div><div class="btnrow"><button class="primary" id="drawerLimit">${l?'Alterar limites':'Aplicar limite'}</button>${l?'<button class="danger" id="drawerRemove">Remover limite</button>':''}</div></section>${l?`<section class="section"><h3>eBPF / cgroup</h3><div class="grid"><div class="box"><span>Limiter ID</span><strong>${l.id}</strong></div><div class="box"><span>Membros</span><strong>${l.member_count??'—'}</strong></div><div class="box"><span>Permitido ↓</span><strong>${bytes(l.counters?.down_allowed_bytes)}</strong></div><div class="box"><span>Descartado ↓</span><strong>${bytes(l.counters?.down_dropped_bytes)}</strong></div></div></section>`:''}<section class="section"><h3>Conexões (${cs.length})</h3>${cs.length?cs.map(c=>`<div class="conn"><div class="row"><strong>${esc(String(c.protocol||'?').toUpperCase())} · ${esc(c.state||'?')}</strong><small>${esc(c.family||'')}</small></div><div style="margin-top:7px"><code>${esc(endpoint(c.local_ip,c.local_port))}</code></div><div style="color:var(--muted);font-size:11px;margin:2px 0">↓</div><div><code>${esc(endpoint(c.remote_ip,c.remote_port))}</code></div><div class="row" style="margin-top:8px"><small>RXQ ${bytes(c.rx_queue_bytes)}</small><small>TXQ ${bytes(c.tx_queue_bytes)}</small></div></div>`).join(''):'<div class="empty">Nenhuma conexão ativa.</div>'}</section>`;$('drawerLimit').onclick=()=>openDialog(p.pid);if($('drawerRemove'))$('drawerRemove').onclick=()=>removeLimit(l.id)}
 function parseRate(r,d='30',u='M'){const m=String(r||'').match(/^([0-9]+)(K|M|G)$/i);return m?{v:m[1],u:m[2].toUpperCase()}:{v:d,u}}
 function openDialog(pid){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(pid));if(!raw)return;S.target=null;const p=proc(raw),l=p.limiter,d=parseRate(l?.limit_down,'30','M'),u=parseRate(l?.limit_up,'5','M');$('pid').value=p.pid;$('limiterId').value=l?.id||'';$('downValue').value=d.v;$('downUnit').value=d.u;$('upValue').value=u.v;$('upUnit').value=u.u;$('dialogTitle').textContent=`${l?'Alterar':'Limitar'} ${p.process}`;$('resetConns').checked=false;$('resetWrap').hidden=!!l;$('dialog').showModal()}
 async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),d=await r.json().catch(()=>({}));if(!r.ok||d.ok===false)throw new Error(d.error||`HTTP ${r.status}`);return d}
