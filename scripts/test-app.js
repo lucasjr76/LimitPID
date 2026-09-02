@@ -31,8 +31,8 @@ function extrai(nome) {
 }
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-const { taxaDown, escapando } = new Function('num',
-  `${extrai('taxaDown')}\n${extrai('escapando')}\nreturn {taxaDown, escapando}`)(num);
+const { taxaDown, escapando, orfao } = new Function('num',
+  `${extrai('taxaDown')}\n${extrai('escapando')}\n${extrai('orfao')}\nreturn {taxaDown, escapando, orfao}`)(num);
 
 // taxaDown: limitador tem prioridade, senao cai na taxa TCP.
 assert.strictEqual(taxaDown({ limiter: { rate: { down_bps: 5e6 } }, rate: { down_bps: 9e6 } }), 5e6);
@@ -55,4 +55,11 @@ assert.strictEqual(escapando({ foreign_conns: 0, counters: { down_allowed_bytes:
   'apply limpo nao avisa nada');
 assert.strictEqual(escapando(null), null);
 
-console.log('OK  app.js: taxaDown e escapando (8 casos)');
+// orfao: o unico sinal do dano herdado. A autopsia do remove NAO pega esse caso
+// porque "/" ja e o original registrado, entao a restauracao acerta e diz "ok".
+assert.strictEqual(orfao({ orphan_at_apply: 3 }), true);
+assert.strictEqual(orfao({ orphan_at_apply: 0 }), false);
+assert.strictEqual(orfao({}), false, 'backend antigo, sem o campo: nao inventa aviso');
+assert.strictEqual(orfao(null), false);
+
+console.log('OK  app.js: taxaDown, escapando e orfao (12 casos)');

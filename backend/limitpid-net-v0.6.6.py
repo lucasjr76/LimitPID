@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 SCHEMA = 2
 RUNROOT = pathlib.Path("/run/limitpid")
 CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
@@ -269,6 +269,11 @@ def read_limiter(root_pid):
         # carimbo do cgroup antigo e escapam. A GUI usa isto junto com
         # counters.down_allowed_bytes == 0 para avisar de forma permanente.
         "foreign_conns": read_int(state / 'foreign_conns', 0),
+        # Processos que ja estavam na raiz do cgroup quando o limitador subiu.
+        # Orfaos de um ciclo anterior que destruiu o escopo systemd deles. A
+        # autopsia do remove NAO pega esse caso: "/" ja e o original registrado,
+        # entao a restauracao acerta e reporta ok. Tem que ser visto no apply.
+        "orphan_at_apply": read_int(state / 'orphan_at_apply', 0),
         "member_pids": members,
         "members": member_info,
         "member_count": len(members),

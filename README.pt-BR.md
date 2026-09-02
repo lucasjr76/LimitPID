@@ -144,7 +144,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.5 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.6 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -215,11 +215,11 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.5 x 0.6.5
-OK  Marcador net-helper.api: 2-0.6.5 (esperado 2-0.6.5)
-OK  Copia do helper Python: limitpid-net-v0.6.5.py
+OK  VERSION bash x python embutido: 0.6.6 x 0.6.6
+OK  Marcador net-helper.api: 2-0.6.6 (esperado 2-0.6.6)
+OK  Copia do helper Python: limitpid-net-v0.6.6.py
 OK  app.css em dia com app.source.css
-OK  app.js: taxaDown e escapando (8 casos)
+OK  app.js: taxaDown, escapando e orfao (12 casos)
 ```
 
 ### Passo 6 — rodar
@@ -487,6 +487,11 @@ depois de cada escrita, avisa no terminal e na GUI, e guarda o estado inteiro em
 (`pid → pretendido → efetivo → situação`) em vez de apagar. O `limitpid gc` limpa depois
 de uma hora.
 
+Depois que um processo é orfanado, os ciclos seguintes registram `/` como origem legítima
+e a autópsia passaria a dizer `ok` para sempre. Por isso o `apply` também conta quantos
+alvos já estão na raiz do cgroup e sinaliza — aviso no terminal e badge **órfão** na linha
+da GUI. Reiniciar o aplicativo recupera o escopo.
+
 Se isso importa para o seu caso, prefira o **modo container** (nada é movido) ou o
 `limitpid run` (o processo nasce dentro do cgroup).
 
@@ -659,10 +664,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.5               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.6.6               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.5.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.6.6.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

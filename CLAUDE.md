@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.5.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.6.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -144,6 +144,20 @@ A v0.6.5 **nao corrige** — o `apply` continua esvaziando o escopo. Ela **detec
 
 Correcao de verdade exigiria o `apply` manter o escopo vivo (deixar um processo para
 tras, ou recriar a unit no `remove`). Nao feito.
+
+**A autopsia so pega o ciclo que CRIA o dano (v0.6.6).** Depois que o processo cai na
+raiz, `/` vira o `original` registrado; todo `apply`/`remove` seguinte restaura para `/`,
+acerta, e o `restore.log` diz `ok`. O dano fica invisivel para sempre. Medido em dois
+ciclos:
+
+| ciclo | autopsia do remove | aviso do apply |
+|---|---|---|
+| 1 — cria o dano | `original-sumiu`, `1 NAO voltaram` | — |
+| 2 — dano herdado | `/ → / → ok` (falso "tudo certo") | `1 processo(s) ja estavam na RAIZ` |
+
+Por isso a v0.6.6 conta, **no apply**, quantos alvos ja estao em `/` e grava em
+`$state/orphan_at_apply`. Vira `orphan_at_apply` no snapshot e o badge **órfão** na linha
+da GUI, mais um paragrafo no painel lateral. Reiniciar o aplicativo recupera o escopo.
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
@@ -296,7 +310,8 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
   `sumido` ou `morto`, mas é raciocínio, não medição).
 - **`apply` destrói o escopo systemd do processo** e o `remove` o larga na raiz
   (`0::/`). Causa reproduzida e documentada (ver *Escopo systemd destruído pelo apply*).
-  A v0.6.5 **avisa** e guarda a autópsia, mas **não corrige** — o processo continua
-  saindo do escopo. Corrigir exigiria o `apply` manter a unit viva.
+  A v0.6.5 avisa no ciclo que cria o dano; a v0.6.6 avisa também nos ciclos seguintes,
+  pelo `orphan_at_apply`. Nenhuma das duas **corrige** — o processo continua saindo do
+  escopo. Corrigir exigiria o `apply` manter a unit viva.
 - Taxa de processo não limitado é **TCP apenas** (v0.6). UDP/QUIC mostram 0 — normal,
   não é bug. Navegador moderno usa QUIC e por isso costuma marcar 0.
