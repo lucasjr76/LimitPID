@@ -162,8 +162,13 @@ function criaLinha(p){
 // gritar na tela, senao a GUI mente dizendo que ha limite quando nao ha.
 function renderContainers(){
   const cs=S.snapshot?.containers||[]; const panel=$('containersPanel');
-  if(!cs.length){panel.hidden=true;$('crows').innerHTML='';return}
+  // O painel some so quando nao ha NADA a oferecer. Com servicos candidatos
+  // ele precisa continuar visivel, senao o botao "Limitar serviço…" some junto
+  // numa maquina sem container nenhum.
+  const svcs=S.snapshot?.services||[];
+  if(!cs.length&&!svcs.length){panel.hidden=true;$('crows').innerHTML='';return}
   panel.hidden=false;
+  if(!cs.length){$('crows').innerHTML='<tr><td colspan="7" class="empty">Nenhum container ou serviço limitado.</td></tr>';return}
   $('crows').innerHTML=cs.map(c=>{
     const r=c.rate||{},d=num(r.down_bps),util=Math.min(100,Math.max(0,num(r.down_util_percent)));
     const morto=c.state==='morto', ativo=c.state==='ativo';
@@ -188,10 +193,24 @@ function renderContainers(){
   $('crows').querySelectorAll('[data-climit]').forEach(b=>b.onclick=()=>openContainerDialog(b.dataset.climit));
   $('crows').querySelectorAll('[data-cdel]').forEach(b=>b.onclick=()=>removeContainerLimit(b.dataset.cdel));
 }
+// Criar limite de servico: nao ha um "docker ps" para units, entao o backend
+// manda a lista de candidatas (system.slice/*.service com pelo menos um
+// processo) e aqui ela vira um seletor.
+function openServiceDialog(){
+  const svcs=S.snapshot?.services||[];
+  if(!svcs.length)return toast('Nenhum serviço do systemd com processo ativo.',true);
+  S.target={kind:'container',name:null,novoServico:true};
+  $('svcPick').innerHTML=svcs.map(x=>`<option value="${esc(x.name)}">${esc(x.name)} — ${x.processes} processo(s)</option>`).join('');
+  $('svcWrap').hidden=false;$('resetWrap').hidden=true;
+  $('pid').value='';$('limiterId').value='';
+  $('downValue').value='10';$('downUnit').value='M';$('upValue').value='2';$('upUnit').value='M';
+  $('dialogTitle').textContent='Limitar serviço do systemd';
+  $('dialog').showModal();
+}
 function openContainerDialog(name){
   const c=(S.snapshot?.containers||[]).find(x=>x.name===name); if(!c)return;
   const d=parseRate(c.limit_down,'10','M'),u=parseRate(c.limit_up,'2','M');
-  S.target={kind:'container',name};$('resetWrap').hidden=true;
+  S.target={kind:'container',name};$('resetWrap').hidden=true;$('svcWrap').hidden=true;
   $('pid').value='';$('limiterId').value='';
   $('downValue').value=d.v;$('downUnit').value=d.u;$('upValue').value=u.v;$('upUnit').value=u.u;
   $('dialogTitle').textContent=`${c.state==='ativo'?'Alterar':'Limitar'} ${c.kind==='service'?'serviço':'container'} ${name}`;
@@ -214,13 +233,15 @@ function openDrawer(pid){S.pid=pid;renderDrawer();$('drawer').classList.add('ope
 function closeDrawer(){S.pid=null;$('drawer').classList.remove('open');$('backdrop').classList.remove('open')}
 function renderDrawer(){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(S.pid));if(!raw)return closeDrawer();const p=proc(raw),l=p.limiter,cs=conns(p.pid);$('drawerTitle').textContent=p.process||'?';$('drawerSub').textContent=`PID ${p.pid} · ${p.user||'?'}`;$('drawerBody').innerHTML=`<section class="section"><h3>Tráfego e limite</h3><div class="grid"><div class="box"><span>Download atual</span><strong>${l?bits(l.rate?.down_bps):(p.rate?.down_bps!=null?bits(p.rate.down_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Upload atual</span><strong>${l?bits(l.rate?.up_bps):(p.rate?.up_bps!=null?bits(p.rate.up_bps)+' <small style="color:var(--muted)">tcp</small>':'não medido')}</strong></div><div class="box"><span>Limite download</span><strong>${l?esc(limTexto(l.limit_down,l.limit_down_bps)):'Ilimitado'}</strong></div><div class="box"><span>Limite upload</span><strong>${l?esc(limTexto(l.limit_up,l.limit_up_bps)):'Ilimitado'}</strong></div></div>${orfao(l)?`<p class="aviso"><strong>${l.orphan_at_apply} processo(s) já estavam na raiz do cgroup</strong> quando este limite foi aplicado — órfãos de um ciclo apply/remove anterior, que destruiu o escopo systemd deles. O limite funciona normalmente; o que ficou perdido é o vínculo com o <code>systemd --user</code>. Reiniciar o aplicativo recupera.</p>`:''}${escapando(l)?`<p class="aviso">O limitador está ativo mas <strong>não alcança ${l.foreign_conns} conexão(ões)</strong> aberta(s) antes dele: o socket é carimbado com o cgroup em que nasceu. Para forçar, remova e aplique de novo marcando <em>derrubar conexões abertas</em> — isso corta o tráfego em andamento.</p>`:''}<div class="btnrow"><button class="primary" id="drawerLimit">${l?'Alterar limites':'Aplicar limite'}</button>${l?'<button class="danger" id="drawerRemove">Remover limite</button>':''}</div></section>${l?`<section class="section"><h3>eBPF / cgroup</h3><div class="grid"><div class="box"><span>Limiter ID</span><strong>${l.id}</strong></div><div class="box"><span>Membros</span><strong>${l.member_count??'—'}</strong></div><div class="box"><span>Permitido ↓</span><strong>${bytes(l.counters?.down_allowed_bytes)}</strong></div><div class="box"><span>Descartado ↓</span><strong>${bytes(l.counters?.down_dropped_bytes)}</strong></div></div></section>`:''}<section class="section"><h3>Conexões (${cs.length})</h3>${cs.length?cs.map(c=>`<div class="conn"><div class="row"><strong>${esc(String(c.protocol||'?').toUpperCase())} · ${esc(c.state||'?')}</strong><small>${esc(c.family||'')}</small></div><div style="margin-top:7px"><code>${esc(endpoint(c.local_ip,c.local_port))}</code></div><div style="color:var(--muted);font-size:11px;margin:2px 0">↓</div><div><code>${esc(endpoint(c.remote_ip,c.remote_port))}</code></div><div class="row" style="margin-top:8px"><small>RXQ ${bytes(c.rx_queue_bytes)}</small><small>TXQ ${bytes(c.tx_queue_bytes)}</small></div></div>`).join(''):'<div class="empty">Nenhuma conexão ativa.</div>'}</section>`;$('drawerLimit').onclick=()=>openDialog(p.pid);if($('drawerRemove'))$('drawerRemove').onclick=()=>removeLimit(l.id)}
 function parseRate(r,d='30',u='M'){const m=String(r||'').match(/^([0-9]+)(K|M|G)$/i);return m?{v:m[1],u:m[2].toUpperCase()}:{v:d,u}}
-function openDialog(pid){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(pid));if(!raw)return;S.target=null;const p=proc(raw),l=p.limiter,d=parseRate(l?.limit_down,'30','M'),u=parseRate(l?.limit_up,'5','M');$('pid').value=p.pid;$('limiterId').value=l?.id||'';$('downValue').value=d.v;$('downUnit').value=d.u;$('upValue').value=u.v;$('upUnit').value=u.u;$('dialogTitle').textContent=`${l?'Alterar':'Limitar'} ${p.process}`;$('resetConns').checked=false;$('resetWrap').hidden=!!l;$('dialog').showModal()}
+function openDialog(pid){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.pid)===Number(pid));if(!raw)return;S.target=null;const p=proc(raw),l=p.limiter,d=parseRate(l?.limit_down,'30','M'),u=parseRate(l?.limit_up,'5','M');$('pid').value=p.pid;$('limiterId').value=l?.id||'';$('downValue').value=d.v;$('downUnit').value=d.u;$('upValue').value=u.v;$('upUnit').value=u.u;$('dialogTitle').textContent=`${l?'Alterar':'Limitar'} ${p.process}`;$('resetConns').checked=false;$('resetWrap').hidden=!!l;$('svcWrap').hidden=true;$('dialog').showModal()}
 async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),d=await r.json().catch(()=>({}));if(!r.ok||d.ok===false)throw new Error(d.error||`HTTP ${r.status}`);return d}
 async function submit(e){e.preventDefault();const pid=Number($('pid').value),id=$('limiterId').value,d=$('downValue').value.trim()+$('downUnit').value,u=$('upValue').value.trim()+$('upUnit').value;if(!/^[1-9][0-9]*(K|M|G)$/.test(d)||!/^[1-9][0-9]*(K|M|G)$/.test(u))return toast('Valores inválidos.',true);
  // Container: reaplica no 'morto' (apply limpa o invalido), altera no 'ativo'.
- if(S.target?.kind==='container'){const nome=S.target.name;const c=(S.snapshot?.containers||[]).find(x=>x.name===nome);
-  const svc=c?.kind==='service',base=svc?'/api/service/':'/api/cgroup/';
-  const rota=base+(c&&c.state==='ativo'?'change':'apply');
+ if(S.target?.kind==='container'){const novo=S.target.novoServico;
+  const nome=novo?$('svcPick').value:S.target.name;
+  const c=(S.snapshot?.containers||[]).find(x=>x.name===nome);
+  const svc=novo||c?.kind==='service',base=svc?'/api/service/':'/api/cgroup/';
+  const rota=base+(!novo&&c&&c.state==='ativo'?'change':'apply');
   try{const x=await post(rota,{name:nome,down:d,up:u});if(x.snapshot){S.snapshot=x.snapshot;render()}$('dialog').close();S.target=null;toast(`${svc?'Serviço':'Container'} ${nome}: ↓${d} ↑${u}`)}catch(e){toast(e.message,true)}return}
  try{const x=id?await post('/api/limit/change',{limiterId:Number(id),down:d,up:u}):await post('/api/limit/apply',{pid,down:d,up:u,reset:$('resetConns').checked});if(x.snapshot){S.snapshot=x.snapshot;render(true)}$('dialog').close();
  // O backend avisa por stderr quantas conexoes ficam fora do limite; mostrar
@@ -241,5 +262,5 @@ function connect(){const proto=location.protocol==='https:'?'wss:':'ws:',ws=new 
   catch{}
   setTimeout(connect,1500)};ws.onerror=()=>{try{ws.close()}catch{}}}
 document.querySelectorAll('th[data-sort]').forEach(th=>{th.onclick=()=>setSort(th.dataset.sort);th.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setSort(th.dataset.sort)}}});
-$('search').oninput=renderRows;$('filter').onchange=renderRows;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.pid)closeDrawer()});$('closeDrawer').onclick=closeDrawer;$('backdrop').onclick=closeDrawer;$('closeDialog').onclick=()=>$('dialog').close();$('cancelDialog').onclick=()=>$('dialog').close();$('limitForm').onsubmit=submit;// Preset preenche os DOIS campos: preencher so o download surpreendia.
+$('search').oninput=renderRows;$('filter').onchange=renderRows;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&S.pid)closeDrawer()});$('addService').onclick=openServiceDialog;$('closeDrawer').onclick=closeDrawer;$('backdrop').onclick=closeDrawer;$('closeDialog').onclick=()=>$('dialog').close();$('cancelDialog').onclick=()=>$('dialog').close();$('limitForm').onsubmit=submit;// Preset preenche os DOIS campos: preencher so o download surpreendia.
 document.querySelectorAll('[data-rate]').forEach(b=>b.onclick=()=>{const r=parseRate(b.dataset.rate);$('downValue').value=r.v;$('downUnit').value=r.u;$('upValue').value=r.v;$('upUnit').value=r.u});connect();

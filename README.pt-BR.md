@@ -145,7 +145,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.7 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.8 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -216,9 +216,9 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.7 x 0.6.7
-OK  Marcador net-helper.api: 2-0.6.7 (esperado 2-0.6.7)
-OK  Copia do helper Python: limitpid-net-v0.6.7.py
+OK  VERSION bash x python embutido: 0.6.8 x 0.6.8
+OK  Marcador net-helper.api: 2-0.6.8 (esperado 2-0.6.8)
+OK  Copia do helper Python: limitpid-net-v0.6.8.py
 OK  app.css em dia com app.source.css
 OK  app.js: taxaDown, escapando e orfao (12 casos)
 ```
@@ -542,8 +542,10 @@ Medido puxando `python:3.12-slim` (44 MB):
 Contadores eBPF desse pull: 48,9 MB permitidos, **6,0 MB descartados**. O `docker.service`
 continuou `active`, com **0 reinícios**.
 
-A GUI altera e remove limite de serviço, mas criar é só pela linha de comando — não há
-lista de candidatos para escolher.
+Na GUI, o botão **Limitar serviço…** no painel Containers lista toda unit de
+`system.slice` que tem pelo menos um processo (26 numa máquina de trabalho, 0,8 ms para
+enumerar) e deixa você escolher. Unit já limitada sai da lista — a essa altura ela é uma
+linha.
 
 ### 4. Cliente e servidor separados
 
@@ -715,10 +717,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.7               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.6.8               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.7.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.6.8.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

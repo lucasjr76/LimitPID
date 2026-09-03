@@ -186,8 +186,17 @@ Contadores eBPF do mesmo pull: 48,9 MB permitidos, **6,0 MB descartados**.
 `systemctl is-active docker` = `active`, `NRestarts` = **0**. Nada foi perturbado.
 
 Slug com prefixo `svc-` para não colidir com um container chamado `docker`.
-A GUI **gerencia** (altera/remove) mas **não cria** limite de serviço — não há lista de
-candidatos; a criação é pela linha de comando.
+
+**Lista de candidatos (v0.6.8).** O modo container tem o `docker ps` para oferecer o que
+limitar; o modo serviço não tinha nada, então a GUI só conseguia alterar e remover.
+`services_list()` varre `system.slice/*.service` e devolve as units com **pelo menos um
+processo** — 26 numa máquina de trabalho, **0,8 ms** para enumerar. Vira a chave
+`services` do snapshot e alimenta o botão *Limitar serviço…* no painel. Unit já limitada
+sai da lista (ela já aparece como linha). Unit parada não entra: sem processo o cgroup
+não serve para nada.
+
+Atenção: `cgroup.procs` é kernfs e reporta **tamanho 0** mesmo quando tem processo — o
+teste `[ -s ]` sempre falha. Tem que ler o arquivo.
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no

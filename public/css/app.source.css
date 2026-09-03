@@ -77,6 +77,7 @@ tbody tr.click{cursor:pointer}
 /* Container com VM: o limite esta ativo mas nao alcanca o trafego do guest. */
 .badge.tun{color:var(--yellow,#ffcf5c);background:rgba(255,207,92,.13);border:1px solid rgba(255,207,92,.35)}
 /* Aviso no painel lateral quando o limitador nao alcanca as conexoes. */
+#svcWrap select{width:100%;padding:8px 10px;border-radius:8px;background:var(--panel2);color:var(--text);border:1px solid var(--line)}
 .aviso{margin:10px 0 0;padding:9px 11px;border-radius:8px;font-size:12px;line-height:1.45;color:#ffcf5c;background:rgba(255,207,92,.09);border:1px solid rgba(255,207,92,.3)}
 .icon.ctr{color:#ffcf8a;background:#2a2313}
 #containersPanel{margin-top:10px}
