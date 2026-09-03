@@ -349,9 +349,20 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
 - CSS: editar `public/css/app.source.css` (legível) e rodar `npm run css`
   (`scripts/css.js`). **Nunca** editar `app.css` na mão — ele é gerado.
   O `npm run check` compara os dois e reprova se estiverem fora de sincronia.
-- Versões antigas do backend ficam em `backend/versions/`; o repo tem git.
+- Versões antigas do backend ficam em `backend/versions/`; só a atual fica na raiz.
+- **`CHANGELOG.md` é o registro de bugs e funcionalidades**, com as medições. Toda versão
+  nova entra lá antes do commit — é o que permite reconstruir *por que* uma decisão foi
+  tomada sem reler o histórico do git inteiro.
 - **Backup antes de mexer na GUI**: `tar czf backup-gui-$(date +%Y%m%d-%H%M).tgz
   public/ server.js electron.js preload.js scripts/ package.json`
+- **Verificar a GUI de verdade, não só o headless.** Rodar o Electron com
+  `--remote-debugging-port=9321` e dirigir por CDP é o único jeito de provar que um botão
+  novo funciona na janela real. Carregar a mesma página num Chromium headless prova que o
+  *código* funciona, não que a *aplicação* funciona — são coisas diferentes, e a segunda
+  é a que o usuário vê. Vale também para capturar tela: `Page.captureScreenshot` pelo CDP
+  fotografa só o renderizador. **Nunca** capture por coordenada de tela (`grim -g "x,y LxA"`):
+  se a janela sair de foco ou for coberta, você fotografa o que estiver ali — já aconteceu
+  de pegar a janela errada, com conteúdo privado do usuário.
 - Rollback do backend: `sudo install -m 755 limitpid-vANTERIOR /usr/local/sbin/limitpid`
 - Verificação: `bash -n` no backend, `node --check` no JS, e compilar os blocos Python
   embutidos antes de instalar.

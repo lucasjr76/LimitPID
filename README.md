@@ -51,6 +51,8 @@ marker.
 - [Repository layout](#repository-layout)
 - [Development](#development)
 
+Every bug and feature, with the measurements behind it: [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## What it does — and what it does not
@@ -588,7 +590,9 @@ What it shows:
 
 - Processes with connections, with **live rates for all of them**, limited or not. The
   unlimited ones come from `tcp_info` and carry a `tcp` marker.
-- A **Containers** panel with state, limit, rate and utilization.
+- A **Containers e serviços** panel with state, limit, rate and utilization, plus a
+  **Limitar serviço…** button that lists every `system.slice` unit with at least one
+  process — that is how you cap `docker pull` without touching the command line.
 - Totals in the header summing **PIDs + containers**.
 - A side drawer per process, with its connections and eBPF counters.
 - Sorting by Process, PID, Connections, Download and Upload (clickable header).
@@ -598,6 +602,16 @@ What it shows:
 - `ESC` closes the drawer; rows are keyboard-navigable.
 - When applying a limit: a checkbox to drop already-open connections, and a warning
   saying how many would escape.
+
+It refuses to lie about a limit that is not working. Three badges say so, permanently —
+not as a toast that fades:
+
+| badge | meaning |
+|---|---|
+| **`N conexão(ões) anterior(es) escapam`** | the limiter is attached but has seen zero bytes: those sockets predate it. Disappears on its own once traffic flows through. |
+| **`órfão`** | some target was already in the cgroup root when the limit was applied — leftover from an earlier cycle that destroyed its systemd scope. Restart the app to recover. |
+| **`VM/TAP escapa`** | the container routes a VM through `/dev/net/tun`; the guest bypasses the limit entirely and cannot be capped. |
+| **`MORTO`** | the container restarted; the eBPF program is stuck on the old cgroup object and the limit no longer applies. Reapply. |
 
 The table is reconciled by PID on every update — never rebuilt from scratch — so text
 selection and keyboard focus survive while the numbers change.
@@ -736,11 +750,13 @@ scripts/install-helper.sh     installs the helper and the sudoers rule
 scripts/uninstall-helper.sh   removes both
 scripts/check.js              post-install validation (npm run check)
 scripts/css.js                generates public/css/app.css (npm run css)
+scripts/test-app.js           guards the GUI decision logic (runs in npm run check)
 server.js                     Express + WebSocket + /api
 public/                       the interface's HTML/CSS/JS
 electron.js, preload.js       Electron shell, tray, zoom
 install-desktop.sh            icon and .desktop entry
 CLAUDE.md                     full technical context (enforcement physics, incidents)
+CHANGELOG.md                  every bug and feature, with the measurements
 ```
 
 Files installed on the system:

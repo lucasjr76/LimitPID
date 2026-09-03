@@ -50,6 +50,8 @@ têm limitador; a taxa deles vem do `tcp_info` e por isso traz o marcador `tcp`.
 - [Estrutura do repositório](#estrutura-do-repositório)
 - [Desenvolvimento](#desenvolvimento)
 
+Histórico completo de bugs e funcionalidades, com as medições: [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## O que ele faz — e o que não faz
@@ -581,7 +583,9 @@ O que ela mostra:
 
 - Processos com conexões, com **velocidade em tempo real de todos**, limitados ou não.
   Os sem limitador vêm do `tcp_info` e trazem o marcador `tcp`.
-- Painel **Containers** com estado, limite, taxa e utilização.
+- Painel **Containers e serviços** com estado, limite, taxa e utilização, mais o botão
+  **Limitar serviço…**, que lista toda unit de `system.slice` com pelo menos um processo —
+  é assim que se limita um `docker pull` sem ir para a linha de comando.
 - Totais no topo somando **PIDs + containers**.
 - Painel lateral por processo, com as conexões e os contadores eBPF.
 - Ordenação por Processo, PID, Conexões, Download e Upload (cabeçalho clicável).
@@ -590,6 +594,16 @@ O que ela mostra:
 - Bandeja com menu (Abrir / Sair); onde não há bandeja, `Ctrl+Q` encerra.
 - `ESC` fecha o painel lateral; as linhas são navegáveis por teclado.
 - Ao limitar: caixa para derrubar conexões já abertas, e aviso de quantas escapam.
+
+Ela se recusa a mentir sobre um limite que não está valendo. Três avisos dizem isso de
+forma **permanente** — não como toast que some:
+
+| badge | significado |
+|---|---|
+| **`N conexão(ões) anterior(es) escapam`** | o limitador está anexado mas não viu um byte: aqueles sockets nasceram antes dele. Some sozinho quando passar tráfego. |
+| **`órfão`** | algum alvo já estava na raiz do cgroup quando o limite foi aplicado — sequela de um ciclo anterior que destruiu o escopo systemd dele. Reiniciar o aplicativo recupera. |
+| **`VM/TAP escapa`** | o container roteia uma VM por `/dev/net/tun`; o convidado passa por fora e não é limitável. |
+| **`MORTO`** | o container reiniciou; o eBPF ficou preso ao objeto de cgroup antigo e o limite não vale mais. Reaplique. |
 
 A tabela é reconciliada por PID a cada atualização — nunca refeita do zero — para não
 perder seleção de texto nem foco de teclado enquanto os números mudam.
@@ -726,11 +740,13 @@ scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois
 scripts/check.js              validação pós-instalação (npm run check)
 scripts/css.js                gera public/css/app.css (npm run css)
+scripts/test-app.js           trava a lógica de decisão da GUI (roda no npm run check)
 server.js                     Express + WebSocket + /api
 public/                       HTML/CSS/JS da interface
 electron.js, preload.js       shell Electron, bandeja, zoom
 install-desktop.sh            ícone e atalho .desktop
 CLAUDE.md                     contexto técnico completo (física do enforcement, incidentes)
+CHANGELOG.md                  cada bug e funcionalidade, com as medições
 ```
 
 Arquivos instalados no sistema:
