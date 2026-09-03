@@ -31,6 +31,9 @@ async function startServer(o={}){
   app.post("/api/cgroup/apply",async(q,r)=>{try{await backend.cgroupApply(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   app.post("/api/cgroup/change",async(q,r)=>{try{await backend.cgroupChange(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   app.post("/api/cgroup/remove",async(q,r)=>{try{await backend.cgroupRemove(q.body.name);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
+  app.post("/api/service/apply",async(q,r)=>{try{await backend.serviceApply(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
+  app.post("/api/service/change",async(q,r)=>{try{await backend.serviceChange(q.body.name,q.body.down,q.body.up);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
+  app.post("/api/service/remove",async(q,r)=>{try{await backend.serviceRemove(q.body.name);r.json({ok:true,snapshot:await backend.snapshot()})}catch(e){fail(r,e,400)}});
   app.get("/{*splat}",(_q,r)=>r.sendFile(path.join(__dirname,"public/index.html")));
   // Erro so vai uma vez: repetir a cada 750ms virava spam de toast na GUI.
   // Repete apenas se a mensagem mudar; volta a zero quando o backend responde.

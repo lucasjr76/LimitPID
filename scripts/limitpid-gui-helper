@@ -14,6 +14,10 @@ valid_rate(){ [[ "${1:-}" =~ ^[1-9][0-9]*(K|M|G)$ ]]; }
 # resolve o cgroup sozinho e recusa qualquer coisa fora de docker-*.scope.
 # Duas barreiras independentes, de proposito.
 valid_name(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; }
+# Unit do systemd: mesmo rigor, mas '@' e legitimo (units instanciadas).
+# ".." recusado a parte -- o regex ja barra barra, e o backend so resolve
+# dentro de system.slice. Tres barreiras, como no modo container.
+valid_unit(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ && "${1:-}" != *..* ]]; }
 cmd="${1:-}"; shift || true
 case "$cmd" in
   health) [[ $# -eq 0 ]]||die "argumentos invalidos"; printf '{"mode":"real","privileged":true}\n' ;;
@@ -25,5 +29,8 @@ case "$cmd" in
   cgroup) [[ $# -eq 3 ]]||die "uso: cgroup NOME DOWN UP"; valid_name "$1"||die "nome de container invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup "$1" "$2" "$3" ;;
   cgroup-change) [[ $# -eq 3 ]]||die "uso: cgroup-change NOME DOWN UP"; valid_name "$1"||die "nome de container invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup-change "$1" "$2" "$3" ;;
   cgroup-remove) [[ $# -eq 1 ]]||die "uso: cgroup-remove NOME"; valid_name "$1"||die "nome de container invalido"; exec "$LIMITPID" cgroup-remove "$1" ;;
+  service) [[ $# -eq 3 ]]||die "uso: service UNIT DOWN UP"; valid_unit "$1"||die "nome de servico invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" service "$1" "$2" "$3" ;;
+  service-change) [[ $# -eq 3 ]]||die "uso: service-change UNIT DOWN UP"; valid_unit "$1"||die "nome de servico invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" service-change "$1" "$2" "$3" ;;
+  service-remove) [[ $# -eq 1 ]]||die "uso: service-remove UNIT"; valid_unit "$1"||die "nome de servico invalido"; exec "$LIMITPID" service-remove "$1" ;;
   *) die "operacao nao permitida: ${cmd:-vazia}" ;;
 esac

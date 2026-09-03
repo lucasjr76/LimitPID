@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.6.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.7.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -159,6 +159,36 @@ Por isso a v0.6.6 conta, **no apply**, quantos alvos ja estao em `/` e grava em
 `$state/orphan_at_apply`. Vira `orphan_at_apply` no snapshot e o badge **órfão** na linha
 da GUI, mais um paragrafo no painel lateral. Reiniciar o aplicativo recupera o escopo.
 
+### `docker pull` — quem baixa é o daemon (v0.6.7)
+Medido: durante um `docker pull`, quem segura as conexões `:443` é o **`dockerd`**
+(PID 2374 em 11 de 12 amostras). O `docker` da linha de comando é só um cliente falando
+por socket Unix — **não tem conexão nenhuma**. Então:
+
+- `limitpid run 5M 1M docker pull ...` limita o cliente e não surte efeito. Pior: o `run`
+  abaixa o privilégio para `$SUDO_USER`, que normalmente não está no grupo `docker`.
+- `limitpid apply $(pidof dockerd)` **é perigoso**: o `apply` move o processo, e o
+  `docker.service` tem exatamente 1 processo. Esvaziá-lo é o cenário do escopo destruído,
+  agora numa unit de sistema ativa.
+
+A v0.6.7 resolve pelo mesmo caminho do modo container: anexa o eBPF ao cgroup que **já
+existe**, sem mover ninguém. `resolve_service_cgroup()` traduz o nome para
+`system.slice/<nome>.service` com regex estrito, recusa `..` e só resolve dentro de
+`system.slice`.
+
+Medido em `python:3.12-slim` (44 MB):
+
+| | tempo do `docker pull` |
+|---|---|
+| sem limite | **12,8 s** |
+| `service docker 5M 1M` | **90,9 s** — 7,1× mais lento |
+
+Contadores eBPF do mesmo pull: 48,9 MB permitidos, **6,0 MB descartados**.
+`systemctl is-active docker` = `active`, `NRestarts` = **0**. Nada foi perturbado.
+
+Slug com prefixo `svc-` para não colidir com um container chamado `docker`.
+A GUI **gerencia** (altera/remove) mas **não cria** limite de serviço — não há lista de
+candidatos; a criação é pela linha de comando.
+
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
 container. Limitar o PID do host **não faz nada** — o download é do container.
@@ -184,6 +214,13 @@ sudo limitpid containers                     # lista + estado (ativo/MORTO/sem l
 sudo limitpid cgroup NOME DOWN UP
 sudo limitpid cgroup-change NOME DOWN UP
 sudo limitpid cgroup-remove NOME
+```
+
+### Por serviço do systemd (v0.6.7+)
+```bash
+sudo limitpid service docker 10M 2M          # limita o docker.service
+sudo limitpid service-change docker 5M 1M
+sudo limitpid service-remove docker
 ```
 
 ### Diagnóstico
@@ -222,6 +259,11 @@ Nome de container vindo da GUI **nunca** vira caminho de cgroup diretamente:
 2. `scripts/limitpid-gui-helper` → `valid_name()`: mesmo regex, antes do backend
 3. `limitpid` → `resolve_container_cgroup()`: resolve via `docker inspect` e recusa
    qualquer coisa fora de `docker-*.scope`
+
+Serviço do systemd tem as **mesmas três camadas**, com regex próprio (`@` é legítimo em
+unit instanciada, `..` é recusado à parte): `unit()` no Node, `valid_unit()` no helper e
+`resolve_service_cgroup()` no backend, que só resolve dentro de `system.slice`. Testado
+contra `../../etc`, `docker/../../x`, `a;id` e `docker..service` — recusados nas três.
 
 Testado contra `../../etc`, `/system.slice`, `ollama;id` — recusados nas 3 camadas.
 `sudoers` (`/etc/sudoers.d/limitpid-gui-*`) libera **apenas** o helper, não o backend.

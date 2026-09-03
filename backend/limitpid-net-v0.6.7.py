@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.6.6"
+VERSION = "0.6.7"
 SCHEMA = 2
 RUNROOT = pathlib.Path("/run/limitpid")
 CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
@@ -419,11 +419,14 @@ def containers_list():
         if not d.is_dir():
             continue
         nome = read_text(d / 'name', d.name)
+        # "service" = unit do systemd (docker.service e afins). Mesmo mecanismo
+        # do container: o eBPF e anexado ao cgroup que ja existe.
+        tipo = read_text(d / 'kind', 'container') or 'container'
         cgpath = read_text(d / 'cgroup', '')
         estado = container_state(d.name, cgpath, read_text(d / 'cgroup_ino', ''))
         pin = BPFROOT / f'cg-{d.name}'
         item = {
-            'name': nome, 'slug': d.name, 'kind': 'container',
+            'name': nome, 'slug': d.name, 'kind': tipo,
             'state': estado, 'limited': estado == 'ativo',
             'limit_down': limite_texto(d, 'down'),
             'limit_up': limite_texto(d, 'up'),
@@ -482,6 +485,11 @@ def containers_list():
                      'down_util_percent': None},
         })
     for c in out:
+        if c.get('kind') == 'service':
+            # A coluna "Imagem" nao se aplica: o badge ja diz que e systemd.
+            c.setdefault('image', '')
+            c['running'] = c['state'] == 'ativo'
+            continue
         c.setdefault('image', ps.get(c['name'], ''))
         c['running'] = c['name'] in ps
 

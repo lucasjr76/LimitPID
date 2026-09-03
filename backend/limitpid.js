@@ -9,6 +9,7 @@ function rate(v,n){ const s=String(v??"").trim().toUpperCase(); if(!/^[1-9][0-9]
 // Nome de container: so nome, nunca caminho. Terceira barreira (helper e
 // backend validam de novo) -- barato e evita depender de uma so camada.
 function cname(v){ const s=String(v??"").trim(); if(!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(s)) throw new Error("nome de container invalido"); return s; }
+function unit(v){ const s=String(v??"").trim(); if(!/^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$/.test(s)||s.includes("..")) throw new Error("nome de servico invalido"); return s; }
 class Backend {
   async run(args,timeout=10000){
     if(MOCK) return {stdout:"",stderr:""};
@@ -36,6 +37,11 @@ class Backend {
   async cgroupApply(n,d,u){ await this.run(["cgroup",cname(n),rate(d,"download"),rate(u,"upload")],15000); }
   async cgroupChange(n,d,u){ await this.run(["cgroup-change",cname(n),rate(d,"download"),rate(u,"upload")]); }
   async cgroupRemove(n){ await this.run(["cgroup-remove",cname(n)]); }
+  // Unit do systemd: '@' e legitimo, ".." nao. O backend so resolve dentro de
+  // system.slice, entao o nome nunca vira caminho aqui.
+  async serviceApply(n,d,u){ await this.run(["service",unit(n),rate(d,"download"),rate(u,"upload")],15000); }
+  async serviceChange(n,d,u){ await this.run(["service-change",unit(n),rate(d,"download"),rate(u,"upload")]); }
+  async serviceRemove(n){ await this.run(["service-remove",unit(n)]); }
   mock(){
     const t=Date.now()/1000,w=(Math.sin(t)+1)/2,down=Math.round(8e6+w*18e6);
     return {schema:2,version:"0.4.1-mock",timestamp:new Date().toISOString(),processes:[

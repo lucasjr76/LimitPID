@@ -40,6 +40,7 @@ marker.
 - [Proving it works](#proving-it-works)
 - [Usage — per process (PID)](#usage--per-process-pid)
 - [Usage — per Docker container](#usage--per-docker-container)
+- [Usage — per systemd service](#usage--per-systemd-service)
 - [When the limit does NOT apply](#when-the-limit-does-not-apply)
 - [The GUI](#the-gui)
 - [Ephemerality](#ephemerality)
@@ -146,7 +147,7 @@ cd LimitPID
 The backend is a single file. **Install the newest version**, never an edited copy:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.6 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.7 /usr/local/sbin/limitpid
 ```
 
 Confirm:
@@ -218,9 +219,9 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.6 x 0.6.6
-OK  Marcador net-helper.api: 2-0.6.6 (esperado 2-0.6.6)
-OK  Copia do helper Python: limitpid-net-v0.6.6.py
+OK  VERSION bash x python embutido: 0.6.7 x 0.6.7
+OK  Marcador net-helper.api: 2-0.6.7 (esperado 2-0.6.7)
+OK  Copia do helper Python: limitpid-net-v0.6.7.py
 OK  app.css em dia com app.source.css
 OK  app.js: taxaDown, escapando e orfao (12 casos)
 ```
@@ -428,9 +429,28 @@ sudo limitpid cgroup CONTAINER_NAME 10M 5M     # reapply
 
 ---
 
+## Usage — per systemd service
+
+Same machinery as container mode: the eBPF program is attached to the cgroup systemd
+already created for the unit. Nothing is moved. This is how you limit `docker pull`.
+
+```bash
+sudo limitpid service docker 10M 2M       # limits docker.service
+sudo limitpid service-change docker 5M 1M # live, drops nothing
+sudo limitpid service-remove docker
+```
+
+The name is resolved to `system.slice/<name>.service` under a strict regex; `..` and any
+path separator are rejected, and resolution never leaves `system.slice`. `.service` is
+appended if you omit it.
+
+Works for any unit — `pacman`, `snapd`, a backup daemon.
+
+---
+
 ## When the limit does NOT apply
 
-Four real traps. All of them measured; the software warns about the first three.
+Five real traps. All of them measured; the software warns about the first three.
 
 ### 1. A VM inside a container (TAP) — **cannot be limited**
 
@@ -502,7 +522,38 @@ already sitting in the cgroup root and flags them — warning on the terminal an
 If this matters for your workload, prefer **container mode** (nothing is ever moved) or
 `limitpid run` (the process is born inside the cgroup).
 
-### 3. Client and server are different processes
+### 3. `docker pull` is done by the daemon, not by the CLI
+
+Measured during a `docker pull`: the process holding the `:443` connections is
+**`dockerd`**. The `docker` command you type is only a client talking over a Unix socket —
+it has **no connection at all**. So `limitpid run 5M 1M docker pull ...` limits the wrong
+process, and `run` also drops privileges to `$SUDO_USER`, who usually is not in the
+`docker` group.
+
+Do **not** reach for `limitpid apply $(pidof dockerd)` either: `apply` moves the process,
+and `docker.service` holds exactly one. Emptying it is the destroyed-scope scenario above,
+on a live system unit.
+
+Use service mode — nothing is moved:
+
+```bash
+sudo limitpid service docker 5M 1M
+```
+
+Measured pulling `python:3.12-slim` (44 MB):
+
+| | `docker pull` time |
+|---|---|
+| no limit | **12.8 s** |
+| `service docker 5M 1M` | **90.9 s** — 7.1× slower |
+
+eBPF counters for that pull: 48.9 MB allowed, **6.0 MB dropped**. `docker.service` stayed
+`active` with **0 restarts**.
+
+The GUI can change and remove a service limit, but creating one is command-line only —
+there is no candidate list to pick from.
+
+### 4. Client and server are different processes
 
 `ollama pull` running on the host is only a **client**: it talks over loopback to the
 server inside the container, and the **container** is what downloads from the internet.
@@ -519,7 +570,7 @@ sudo limitpid cgroup ollama 10M 5M
 The same applies to `docker pull`, to package managers with a separate daemon, and to
 browsers that isolate networking in another process.
 
-### 4. A connection opened before the limit
+### 5. A connection opened before the limit
 
 Already covered in [Sockets are stamped at creation](#sockets-are-stamped-at-creation).
 `apply` tells you how many connections are left out.
@@ -675,10 +726,10 @@ at the next reboot.
 ## Repository layout
 
 ```
-limitpid-v0.6.6               backend (Bash + C + eBPF + embedded Python)
+limitpid-v0.6.7               backend (Bash + C + eBPF + embedded Python)
 backend/versions/             previous backend versions (rollback)
 backend/limitpid.js           Node → helper bridge
-backend/limitpid-net-v0.6.6.py   copy of the extracted Python helper (backup/reference)
+backend/limitpid-net-v0.6.7.py   copy of the extracted Python helper (backup/reference)
 scripts/limitpid-gui-helper   sudo bridge, validates every argument
 scripts/install-helper.sh     installs the helper and the sudoers rule
 scripts/uninstall-helper.sh   removes both

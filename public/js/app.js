@@ -172,9 +172,11 @@ function renderContainers(){
     // ve socket, entao esse trafego escapa do limite inteiro. Dizer so
     // "limitado" aqui seria mentira -- e falha silenciosa e o pior defeito
     // possivel neste projeto.
+    const svc=c.kind==='service';
+    const tipo=svc?'<span class="badge">systemd</span> ':'';
     const est=morto?'<span class="badge dead">MORTO — reaplique</span>'
       :ativo?('<span class="badge limit">limitado</span>'+(c.tun_bypass?' <span class="badge tun" title="O container roteia uma VM por /dev/net/tun. Esse tráfego não passa por socket, então o eBPF não o alcança: o limite vale para os sockets do container, não para o guest.">VM/TAP escapa</span>':'')):'';
-    return `<tr data-cname="${nome}"><td><div class="proc"><div class="icon ctr">${esc(initial(c.name))}</div><div><strong>${nome}</strong> ${est}</div></div></td>`+
+    return `<tr data-cname="${nome}"><td><div class="proc"><div class="icon ctr">${esc(initial(c.name))}</div><div><strong>${nome}</strong> ${tipo}${est}</div></div></td>`+
       `<td><small style="color:var(--muted)">${esc((c.image||'').slice(0,28))}</small></td>`+
       `<td class="down">${ativo?bits(d):'—'}</td>`+
       `<td>${c.limit_down?`<span class="badge limit">${esc(limTexto(c.limit_down,c.limit_down_bps))}</span>`:'∞'}</td>`+
@@ -192,12 +194,19 @@ function openContainerDialog(name){
   S.target={kind:'container',name};$('resetWrap').hidden=true;
   $('pid').value='';$('limiterId').value='';
   $('downValue').value=d.v;$('downUnit').value=d.u;$('upValue').value=u.v;$('upUnit').value=u.u;
-  $('dialogTitle').textContent=`${c.state==='ativo'?'Alterar':'Limitar'} container ${name}`;
+  $('dialogTitle').textContent=`${c.state==='ativo'?'Alterar':'Limitar'} ${c.kind==='service'?'serviço':'container'} ${name}`;
   $('dialog').showModal();
 }
+// Servico do systemd e container usam a MESMA maquinaria no backend (eBPF
+// anexado a um cgroup que ja existe), mas endpoints diferentes -- cada um tem
+// sua propria validacao de nome, e misturar as duas abriria o caminho que as
+// tres camadas existem para fechar.
+const ehServico=(name)=>(S.snapshot?.containers||[]).find(c=>c.name===name)?.kind==='service';
 async function removeContainerLimit(name){
-  if(!confirm(`Remover limite do container ${name}?`))return;
-  try{const x=await post('/api/cgroup/remove',{name});if(x.snapshot){S.snapshot=x.snapshot;render()}toast('Limite do container removido.')}
+  const svc=ehServico(name);
+  if(!confirm(`Remover limite do ${svc?'serviço':'container'} ${name}?`))return;
+  try{const x=await post(svc?'/api/service/remove':'/api/cgroup/remove',{name});if(x.snapshot){S.snapshot=x.snapshot;render()}
+   toast(`Limite do ${svc?'serviço':'container'} removido.`)}
   catch(e){toast(e.message,true)}
 }
 function endpoint(ip,port){ip=String(ip||'?');if(ip.includes(':')&&!ip.startsWith('['))ip=`[${ip}]`;return `${ip}:${port??'?'}`}
@@ -209,8 +218,10 @@ function openDialog(pid){const raw=(S.snapshot?.processes||[]).find(p=>Number(p.
 async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),d=await r.json().catch(()=>({}));if(!r.ok||d.ok===false)throw new Error(d.error||`HTTP ${r.status}`);return d}
 async function submit(e){e.preventDefault();const pid=Number($('pid').value),id=$('limiterId').value,d=$('downValue').value.trim()+$('downUnit').value,u=$('upValue').value.trim()+$('upUnit').value;if(!/^[1-9][0-9]*(K|M|G)$/.test(d)||!/^[1-9][0-9]*(K|M|G)$/.test(u))return toast('Valores inválidos.',true);
  // Container: reaplica no 'morto' (apply limpa o invalido), altera no 'ativo'.
- if(S.target?.kind==='container'){const nome=S.target.name;const c=(S.snapshot?.containers||[]).find(x=>x.name===nome);const rota=c&&c.state==='ativo'?'/api/cgroup/change':'/api/cgroup/apply';
-  try{const x=await post(rota,{name:nome,down:d,up:u});if(x.snapshot){S.snapshot=x.snapshot;render()}$('dialog').close();S.target=null;toast(`Container ${nome}: ↓${d} ↑${u}`)}catch(e){toast(e.message,true)}return}
+ if(S.target?.kind==='container'){const nome=S.target.name;const c=(S.snapshot?.containers||[]).find(x=>x.name===nome);
+  const svc=c?.kind==='service',base=svc?'/api/service/':'/api/cgroup/';
+  const rota=base+(c&&c.state==='ativo'?'change':'apply');
+  try{const x=await post(rota,{name:nome,down:d,up:u});if(x.snapshot){S.snapshot=x.snapshot;render()}$('dialog').close();S.target=null;toast(`${svc?'Serviço':'Container'} ${nome}: ↓${d} ↑${u}`)}catch(e){toast(e.message,true)}return}
  try{const x=id?await post('/api/limit/change',{limiterId:Number(id),down:d,up:u}):await post('/api/limit/apply',{pid,down:d,up:u,reset:$('resetConns').checked});if(x.snapshot){S.snapshot=x.snapshot;render(true)}$('dialog').close();
  // O backend avisa por stderr quantas conexoes ficam fora do limite; mostrar
  // isso e o que evita o usuario achar que limitou e nao limitou.
