@@ -149,7 +149,7 @@ cd LimitPID
 The backend is a single file. **Install the newest version**, never an edited copy:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.8 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.9 /usr/local/sbin/limitpid
 ```
 
 Confirm:
@@ -221,9 +221,9 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.8 x 0.6.8
-OK  Marcador net-helper.api: 2-0.6.8 (esperado 2-0.6.8)
-OK  Copia do helper Python: limitpid-net-v0.6.8.py
+OK  VERSION bash x python embutido: 0.6.9 x 0.6.9
+OK  Marcador net-helper.api: 2-0.6.9 (esperado 2-0.6.9)
+OK  Copia do helper Python: limitpid-net-v0.6.9.py
 OK  app.css em dia com app.source.css
 OK  app.js: taxaDown, escapando e orfao (12 casos)
 ```
@@ -728,6 +728,10 @@ at the next reboot.
 - **Rates for processes without a limiter are TCP-only** (`tcp_info`), so **UDP and QUIC
   read 0**. Modern browsers use QUIC and therefore often show 0 while downloading.
   Limited processes use eBPF counters and are exact.
+- Rate limiting was only validated at **high rate** from v0.6.9 on. A clock race in the
+  token bucket used to let ~2.5× through at 60 Mbit/s while being exact at 5 Mbit/s — see
+  the [CHANGELOG](CHANGELOG.md). If you change the eBPF yourself, bump `BPF_API` or the
+  cached object is never rebuilt.
 - **Upload has never been validated under real load** — only download. The value is
   written and applied to the BPF map, but the measurement is missing.
 - `docker compose down/up` recreating the same name is untested. It should land on
@@ -741,10 +745,10 @@ at the next reboot.
 ## Repository layout
 
 ```
-limitpid-v0.6.8               backend (Bash + C + eBPF + embedded Python)
+limitpid-v0.6.9               backend (Bash + C + eBPF + embedded Python)
 backend/versions/             previous backend versions (rollback)
 backend/limitpid.js           Node → helper bridge
-backend/limitpid-net-v0.6.8.py   copy of the extracted Python helper (backup/reference)
+backend/limitpid-net-v0.6.9.py   copy of the extracted Python helper (backup/reference)
 scripts/limitpid-gui-helper   sudo bridge, validates every argument
 scripts/install-helper.sh     installs the helper and the sudoers rule
 scripts/uninstall-helper.sh   removes both

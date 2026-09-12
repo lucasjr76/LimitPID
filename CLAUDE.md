@@ -198,6 +198,35 @@ não serve para nada.
 Atenção: `cgroup.procs` é kernfs e reporta **tamanho 0** mesmo quando tem processo — o
 teste `[ -s ]` sempre falha. Tem que ler o arquivo.
 
+### Corrida de relógio no token bucket (v0.6.9) — o limite vazava
+`now = bpf_ktime_get_ns()` era lido **fora** do `bpf_spin_lock`. Dois CPUs podem ler
+carimbos de tempo e entrar no lock **fora de ordem**. Quando isso acontece,
+`now < s->last_ns`, e `delta = now - s->last_ns` faz **underflow de u64** — um número
+enorme, que o clamp `if (delta > NS_PER_SEC) delta = NS_PER_SEC` transformava em um
+**segundo inteiro de tokens** (7,5 MB a 60 Mbit/s) injetado num único pacote.
+
+Com 24 CPUs e taxa de pacote alta isso acontecia o tempo todo e o balde vivia cheio.
+A 5 Mbit/s a taxa de pacote é baixa, a corrida quase não ocorre — por isso o defeito
+**parecia depender da velocidade** e passou despercebido nos testes de 4M e 5M.
+
+Medido no `hf download` do autor (84 conexões TCP, limite 60M):
+
+| | antes (v0.6.8) | depois (v0.6.9) |
+|---|---|---|
+| limite 5 Mbit/s | 5 | 5 |
+| limite 20 Mbit/s | **24** (+20%) | 20 |
+| limite 60 Mbit/s | **151 e 146** (2,5×) | 56 / 61 / 59 / 59 |
+
+Correção: refila só quando o carimbo avança.
+
+```c
+} else if (now > s->last_ns) {   /* carimbo atrasado NAO refila */
+```
+
+Perde-se um refill minúsculo; ganha-se o teto de verdade. **`BPF_API` foi bumpado
+(2 → 3)** para forçar a recompilação do objeto — sem isso o `.bpf.o` antigo continuaria
+em disco e a correção não chegaria a lugar nenhum.
+
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
 container. Limitar o PID do host **não faz nada** — o download é do container.
@@ -363,6 +392,12 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
   fotografa só o renderizador. **Nunca** capture por coordenada de tela (`grim -g "x,y LxA"`):
   se a janela sair de foco ou for coberta, você fotografa o que estiver ali — já aconteceu
   de pegar a janela errada, com conteúdo privado do usuário.
+- **Mexeu no código eBPF? Bumpe `BPF_API`.** O objeto compilado é cacheado em
+  `/usr/local/libexec/limitpid/limitpid.bpf.o` e só é refeito quando a API muda. Bumpar
+  só o `VERSION` re-extrai o Python, **não** recompila o eBPF.
+- **Teste o limite em rate ALTO e sob carga.** A corrida de relógio da v0.6.9 sobreviveu
+  a meses de testes porque 4M e 5M não geram taxa de pacote suficiente para disparar.
+  Um teto que bate a 5 Mbit/s não prova nada sobre 60 Mbit/s.
 - Rollback do backend: `sudo install -m 755 limitpid-vANTERIOR /usr/local/sbin/limitpid`
 - Verificação: `bash -n` no backend, `node --check` no JS, e compilar os blocos Python
   embutidos antes de instalar.

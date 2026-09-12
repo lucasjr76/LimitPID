@@ -147,7 +147,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.8 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.9 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -218,9 +218,9 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.8 x 0.6.8
-OK  Marcador net-helper.api: 2-0.6.8 (esperado 2-0.6.8)
-OK  Copia do helper Python: limitpid-net-v0.6.8.py
+OK  VERSION bash x python embutido: 0.6.9 x 0.6.9
+OK  Marcador net-helper.api: 2-0.6.9 (esperado 2-0.6.9)
+OK  Copia do helper Python: limitpid-net-v0.6.9.py
 OK  app.css em dia com app.source.css
 OK  app.js: taxaDown, escapando e orfao (12 casos)
 ```
@@ -718,6 +718,10 @@ sozinhos.
 - **A taxa de processos sem limitador é só TCP** (`tcp_info`), então **UDP e QUIC marcam
   0**. Navegadores modernos usam QUIC e por isso costumam mostrar 0 mesmo baixando.
   Processos limitados usam os contadores eBPF e são exatos.
+- O limite só passou a ser validado em **taxa alta** a partir da v0.6.9. Uma corrida de
+  relógio no token bucket deixava passar ~2,5× a 60 Mbit/s enquanto batia exato a
+  5 Mbit/s — ver o [CHANGELOG](CHANGELOG.md). Se você mexer no eBPF, bumpe `BPF_API` ou o
+  objeto cacheado nunca é recompilado.
 - **Upload nunca foi validado sob carga real** — só download. O valor é gravado e
   aplicado ao BPF map, mas falta a medição.
 - `docker compose down/up` com recriação do mesmo nome não foi testado. Deve cair em
@@ -731,10 +735,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.8               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.6.9               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.8.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.6.9.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

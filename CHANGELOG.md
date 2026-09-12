@@ -8,6 +8,42 @@ A numeração é a do **backend** (`limitpid-vX.Y.Z`); a GUI acompanha.
 
 ---
 
+## [0.6.9] — 2026-09-11
+
+### Corrigido — o limite vazava em taxas altas
+**Corrida de relógio no token bucket.** `now = bpf_ktime_get_ns()` era lido **fora** do
+`bpf_spin_lock`. Dois CPUs podem ler carimbos e entrar no lock fora de ordem; quando isso
+acontece `now < last_ns`, e `delta = now - last_ns` faz **underflow de u64**. O número
+gigante caía no clamp `delta > NS_PER_SEC` e virava um **segundo inteiro de tokens**
+(7,5 MB a 60 Mbit/s) injetado num único pacote.
+
+Com 24 CPUs e taxa de pacote alta isso ocorria continuamente e o balde vivia cheio.
+A 5 Mbit/s a taxa de pacote é baixa demais para a corrida aparecer — por isso o defeito
+**parecia depender da velocidade** e sobreviveu aos testes de 4M e 5M.
+
+Medido num `hf download` de 40 GB (84 conexões TCP):
+
+| limite configurado | antes (v0.6.8) | depois (v0.6.9) |
+|---|---|---|
+| 5 Mbit/s | 5 | 5 |
+| 20 Mbit/s | **24** (+20%) | 20 |
+| 60 Mbit/s | **151 e 146** (2,5×) | 56 / 61 / 59 / 59 |
+
+Correção de uma linha — carimbo atrasado simplesmente não refila:
+
+```c
+} else if (now > s->last_ns) {
+```
+
+`BPF_API` foi bumpado (2 → 3) para forçar a recompilação do objeto. Sem isso o
+`.bpf.o` antigo continuaria em disco e a correção não chegaria ao kernel.
+
+### Lição
+Um teto que bate a 5 Mbit/s **não prova nada** sobre 60 Mbit/s. Teste de rate limiting
+precisa rodar em taxa alta e sob carga real.
+
+---
+
 ## [0.6.8] — 2026-09-02
 
 ### Adicionado
