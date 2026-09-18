@@ -63,9 +63,17 @@ function escapando(l){
 // do remove nao pega esse caso -- "/" ja e o original registrado, entao a
 // restauracao acerta e diz ok. So da para ver aqui.
 function orfao(l){ return num(l?.orphan_at_apply)>0; }
+// Processo sem limitador com socket UDP e taxa TCP zerada: a taxa dele NAO e
+// medida (so ha contador por socket para TCP). Mostrar "0.00 bps" ai era mentira
+// -- o Ghost Downloader baixava 19 Mbit/s por UDP e aparecia como ocioso.
+function udpCego(p){ return !p.limiter && num(p.udp)>0 && !(num(p.rate?.down_bps)>0); }
 function celulasVolateis(p){
   const l=p.limiter,d=num(l?.rate?.down_bps),u=num(l?.rate?.up_bps),
         util=Math.min(100,Math.max(0,num(l?.rate?.down_util_percent)));
+  if(udpCego(p))return{
+    conns:`<span class="badge">${p.total_connections} · TCP ${p.tcp} / UDP ${p.udp}</span>`,
+    down:'?',up:'?',
+    util:`<span class="badge tun" title="Este processo tem ${p.udp} socket(s) UDP ativos. Sem limitador, só o TCP tem contador por socket — tráfego UDP/QUIC não é medido e pode ser alto. Limitar o processo passa a medir tudo pelo eBPF.">UDP ativo — taxa não medida</span>`};
   if(escapando(l))return{
     conns:`<span class="badge">${p.total_connections} · TCP ${p.tcp} / UDP ${p.udp}</span>`,
     down:bits(d),up:bits(u),

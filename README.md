@@ -149,7 +149,7 @@ cd LimitPID
 The backend is a single file. **Install the newest version**, never an edited copy:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.9 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.6.10 /usr/local/sbin/limitpid
 ```
 
 Confirm:
@@ -221,11 +221,11 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.9 x 0.6.9
-OK  Marcador net-helper.api: 2-0.6.9 (esperado 2-0.6.9)
-OK  Copia do helper Python: limitpid-net-v0.6.9.py
+OK  VERSION bash x python embutido: 0.6.10 x 0.6.10
+OK  Marcador net-helper.api: 2-0.6.10 (esperado 2-0.6.10)
+OK  Copia do helper Python: limitpid-net-v0.6.10.py
 OK  app.css em dia com app.source.css
-OK  app.js: taxaDown, escapando e orfao (12 casos)
+OK  app.js: taxaDown, escapando, orfao e udpCego (16 casos)
 ```
 
 ### Step 6 — run it
@@ -726,7 +726,8 @@ at the next reboot.
 - **VM-in-container traffic (TAP) cannot be limited.** Detected and reported; no fix is
   possible through cgroups.
 - **Rates for processes without a limiter are TCP-only** (`tcp_info`), so **UDP and QUIC
-  read 0**. Modern browsers use QUIC and therefore often show 0 while downloading.
+  cannot be measured** — since v0.6.10 the GUI says so (`UDP ativo — taxa não medida`)
+  instead of showing 0. Modern browsers use QUIC and therefore often show 0 while downloading.
   Limited processes use eBPF counters and are exact.
 - Rate limiting was only validated at **high rate** from v0.6.9 on. A clock race in the
   token bucket used to let ~2.5× through at 60 Mbit/s while being exact at 5 Mbit/s — see
@@ -745,10 +746,10 @@ at the next reboot.
 ## Repository layout
 
 ```
-limitpid-v0.6.9               backend (Bash + C + eBPF + embedded Python)
+limitpid-v0.6.10               backend (Bash + C + eBPF + embedded Python)
 backend/versions/             previous backend versions (rollback)
 backend/limitpid.js           Node → helper bridge
-backend/limitpid-net-v0.6.9.py   copy of the extracted Python helper (backup/reference)
+backend/limitpid-net-v0.6.10.py   copy of the extracted Python helper (backup/reference)
 scripts/limitpid-gui-helper   sudo bridge, validates every argument
 scripts/install-helper.sh     installs the helper and the sudoers rule
 scripts/uninstall-helper.sh   removes both

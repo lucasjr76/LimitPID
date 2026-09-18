@@ -8,6 +8,36 @@ A numeração é a do **backend** (`limitpid-vX.Y.Z`); a GUI acompanha.
 
 ---
 
+## [0.6.10] — 2026-09-18
+
+### Corrigido — processo consumindo banda e "invisível" na lista
+Um download de **19 Mbit/s** do **Ghost Downloader** (AppImage) não aparecia de jeito
+útil. Ele estava na lista, mas três defeitos empilhados o escondiam:
+
+| defeito | antes | depois |
+|---|---|---|
+| nome | `AppRun` — o lançador genérico de todo AppImage | `Ghost-Downloader` |
+| sockets UDP | `UDP 0` — todo UDP não-conectado era descartado | `UDP 17` |
+| taxa | `0.00 bps` — e a ordenação o afundava no fim | `?` + badge **UDP ativo — taxa não medida** |
+
+- **Nome de AppImage.** `nome_exibicao()` tira o nome do arquivo `.AppImage` (argv[0])
+  ou do binário real montado em `/tmp/.mount_*`, e remove sufixo de versão.
+- **UDP de cliente.** A regra antiga descartava todo UDP com `remote_port == 0`, para
+  esconder DNS e mDNS. Mas cliente QUIC e torrent usa exatamente UDP não-conectado.
+  Medido nesta máquina: **todo** daemon (resolved :53, avahi :5353, NetworkManager :68,
+  kdeconnect :1716) tem **0** socket em porta efêmera; o Ghost tinha **17 de 31**.
+  UDP não-conectado em porta ≥ 32768 agora conta. Nenhum daemon entrou por engano.
+- **Honestidade na taxa.** Sem limitador, só TCP tem contador por socket (o `ss` não
+  expõe bytes de UDP — verificado). Em vez de mostrar `0.00 bps`, a GUI agora diz que
+  há UDP ativo e que a taxa não é medida.
+
+### Ainda não resolvido
+- A **taxa** de UDP/QUIC de processo sem limitador continua sem medição. A correção de
+  verdade é um programa eBPF só de contagem, anexado ao cgroup raiz, contando bytes por
+  cgroup — ver *Bugs conhecidos*.
+
+---
+
 ## [0.6.9] — 2026-09-11
 
 ### Corrigido — o limite vazava em taxas altas
@@ -276,5 +306,5 @@ Ver histórico do git. Marcos:
 | `apply` destrói o escopo systemd do processo | detectado e avisado (v0.6.5/0.6.6); **não corrigido** |
 | VM em container (TAP) escapa do limite | detectado e avisado (v0.6.3); **impossível pelo cgroup** |
 | Upload nunca validado sob carga real | só download foi medido |
-| Taxa de processo sem limitador é **TCP apenas** | UDP/QUIC mostram 0 — normal, não é bug |
+| Taxa de processo sem limitador é **TCP apenas** | desde a v0.6.10 a GUI **avisa** (`UDP ativo — taxa não medida`) em vez de mostrar 0; medir exige eBPF de contagem no cgroup raiz |
 | `docker compose down/up` com mesmo nome | não testado; deve cair em `sumido` ou `MORTO` |

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.6.9"
+VERSION = "0.6.10"
 SCHEMA = 2
 RUNROOT = pathlib.Path("/run/limitpid")
 CGROOT = pathlib.Path("/sys/fs/cgroup/limitpid")
@@ -67,7 +67,26 @@ def proc_info(pid):
         exe = os.readlink(base / "exe")
     except Exception:
         pass
-    return {"pid": int(pid), "process": comm, "user": user, "uid": uid, "cmdline": cmdline, "exe": exe}
+    return {"pid": int(pid), "process": nome_exibicao(comm, cmdline, exe), "user": user,
+            "uid": uid, "cmdline": cmdline, "exe": exe}
+
+
+def nome_exibicao(comm, cmdline, exe):
+    """Nome para a tela. Todo AppImage roda sob o lancador generico "AppRun",
+    entao a lista mostrava "AppRun" para o Ghost Downloader, o LM Studio de
+    AppImage e qualquer outro -- o usuario nao reconhecia o processo que estava
+    consumindo banda. Aqui o nome sai do arquivo .AppImage (argv[0]) ou, na
+    falta, do binario real montado em /tmp/.mount_*."""
+    if comm != 'AppRun':
+        return comm
+    arg0 = cmdline.split(' ', 1)[0] if cmdline else ''
+    base = os.path.basename(arg0 if arg0.endswith('.AppImage') else exe) or comm
+    for suf in ('.AppImage', '.bin'):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+    # "Ghost-Downloader-v4.3.7-Linux-x86_64" -> "Ghost-Downloader"
+    base = re.sub(r'[-_]v?\d+(\.\d+)+.*$', '', base)
+    return base or comm
 
 
 def get_cgroup(pid):
@@ -185,7 +204,13 @@ def all_connections(include_all=False, only_pid=None):
         if not include_all:
             if r['protocol'] == 'tcp' and r['state'] in {'LISTEN', 'CLOSE', 'TIME_WAIT'}:
                 continue
-            if r['protocol'] == 'udp' and r['remote_port'] == 0:
+            # UDP nao-conectado era descartado inteiro para esconder DNS/mDNS.
+            # Mas cliente QUIC e torrent usa exatamente UDP nao-conectado: o
+            # Ghost Downloader baixava 19 Mbit/s com 31 sockets UDP e a lista
+            # mostrava "UDP 0". Medido: todo daemon (resolved 53, avahi 5353,
+            # NetworkManager 68, kdeconnect 1716) tem 0 socket em porta
+            # efemera; o Ghost tinha 17. Porta >= 32768 = cliente.
+            if r['protocol'] == 'udp' and r['remote_port'] == 0 and r['local_port'] < 32768:
                 continue
         pids = inode_map.get(r['inode'], [])
         if only_pid is not None and only_pid not in pids:

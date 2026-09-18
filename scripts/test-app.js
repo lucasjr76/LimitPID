@@ -31,8 +31,8 @@ function extrai(nome) {
 }
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-const { taxaDown, escapando, orfao } = new Function('num',
-  `${extrai('taxaDown')}\n${extrai('escapando')}\n${extrai('orfao')}\nreturn {taxaDown, escapando, orfao}`)(num);
+const { taxaDown, escapando, orfao, udpCego } = new Function('num',
+  `${extrai('taxaDown')}\n${extrai('escapando')}\n${extrai('orfao')}\n${extrai('udpCego')}\nreturn {taxaDown, escapando, orfao, udpCego}`)(num);
 
 // taxaDown: limitador tem prioridade, senao cai na taxa TCP.
 assert.strictEqual(taxaDown({ limiter: { rate: { down_bps: 5e6 } }, rate: { down_bps: 9e6 } }), 5e6);
@@ -62,4 +62,10 @@ assert.strictEqual(orfao({ orphan_at_apply: 0 }), false);
 assert.strictEqual(orfao({}), false, 'backend antigo, sem o campo: nao inventa aviso');
 assert.strictEqual(orfao(null), false);
 
-console.log('OK  app.js: taxaDown, escapando e orfao (12 casos)');
+// udpCego: o caso do Ghost Downloader -- 19 Mbit/s por UDP aparecendo como 0 bps.
+assert.strictEqual(udpCego({ udp: 17, rate: { down_bps: 0 } }), true);
+assert.strictEqual(udpCego({ udp: 17, rate: { down_bps: 5e6 } }), false, 'TCP medido: nao e cego');
+assert.strictEqual(udpCego({ udp: 17, limiter: {}, rate: {} }), false, 'limitado: eBPF mede UDP');
+assert.strictEqual(udpCego({ udp: 0, rate: { down_bps: 0 } }), false);
+
+console.log('OK  app.js: taxaDown, escapando, orfao e udpCego (16 casos)');

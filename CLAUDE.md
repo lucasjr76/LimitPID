@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.7.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.6.10.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -226,6 +226,23 @@ Correção: refila só quando o carimbo avança.
 Perde-se um refill minúsculo; ganha-se o teto de verdade. **`BPF_API` foi bumpado
 (2 → 3)** para forçar a recompilação do objeto — sem isso o `.bpf.o` antigo continuaria
 em disco e a correção não chegaria a lugar nenhum.
+
+### Processo que consome banda e some da lista (v0.6.10)
+Caso real: Ghost Downloader (AppImage) a 19 Mbit/s. Estava na lista, invisível por três
+motivos empilhados — nome `AppRun`, `UDP 0`, taxa `0.00 bps` afundando na ordenação.
+
+- `nome_exibicao()`: AppImage roda sob o lançador `AppRun`; o nome real sai do `.AppImage`
+  em argv[0] ou do binário em `/tmp/.mount_*`.
+- UDP não-conectado era descartado inteiro (`remote_port == 0`) para esconder DNS/mDNS.
+  Agora conta se a porta local for **efêmera (≥ 32768)** — medido: daemons têm 0 socket
+  efêmero, clientes QUIC/torrent têm vários.
+- `udpCego()` na GUI: sem limitador, com UDP e sem taxa TCP → badge
+  `UDP ativo — taxa não medida`, nunca `0.00 bps`.
+- **`ss` não expõe bytes de UDP** (verificado com `ss -uapie`). Medir taxa UDP de processo
+  sem limitador exige eBPF de contagem — pendência aberta.
+
+**Antes de concluir que "o processo não aparece", procure pelo PID na lista** — pode estar
+lá com outro nome. Diagnóstico: `ss -uanpH | grep pid=<PID>` mostra os sockets UDP.
 
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
@@ -418,5 +435,6 @@ a gravar se a saída não começar em `:root{` ou tiver resto de comentário.
   A v0.6.5 avisa no ciclo que cria o dano; a v0.6.6 avisa também nos ciclos seguintes,
   pelo `orphan_at_apply`. Nenhuma das duas **corrige** — o processo continua saindo do
   escopo. Corrigir exigiria o `apply` manter a unit viva.
-- Taxa de processo não limitado é **TCP apenas** (v0.6). UDP/QUIC mostram 0 — normal,
-  não é bug. Navegador moderno usa QUIC e por isso costuma marcar 0.
+- Taxa de processo não limitado é **TCP apenas** (v0.6). Desde a v0.6.10 a GUI **avisa**
+  (`UDP ativo — taxa não medida`) em vez de mostrar 0. Medir de verdade exige um eBPF só
+  de contagem no cgroup raiz, contando bytes por cgroup — não feito.
