@@ -31,8 +31,9 @@ function extrai(nome) {
 }
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-const { taxaDown, escapando, orfao, udpCego } = new Function('num',
-  `${extrai('taxaDown')}\n${extrai('escapando')}\n${extrai('orfao')}\n${extrai('udpCego')}\nreturn {taxaDown, escapando, orfao, udpCego}`)(num);
+const nomes = ['taxaDown', 'escapando', 'orfao', 'udpCego', 'alvoErrado'];
+const { taxaDown, escapando, orfao, udpCego, alvoErrado } = new Function('num',
+  `${nomes.map(extrai).join('\n')}\nreturn {${nomes}}`)(num);
 
 // taxaDown: limitador tem prioridade, senao cai na taxa TCP.
 assert.strictEqual(taxaDown({ limiter: { rate: { down_bps: 5e6 } }, rate: { down_bps: 9e6 } }), 5e6);
@@ -68,4 +69,10 @@ assert.strictEqual(udpCego({ udp: 17, rate: { down_bps: 5e6 } }), false, 'TCP me
 assert.strictEqual(udpCego({ udp: 17, limiter: {}, rate: {} }), false, 'limitado: eBPF mede UDP');
 assert.strictEqual(udpCego({ udp: 0, rate: { down_bps: 0 } }), false);
 
-console.log('OK  app.js: taxaDown, escapando, orfao e udpCego (16 casos)');
+// alvoErrado: limitador anexado num cgroup que nao e o do socket.
+assert.strictEqual(alvoErrado({ sockets_cgroup: '/user.slice/x.scope' }), true);
+assert.strictEqual(alvoErrado({ sockets_cgroup: '' }), false, 'vazio = alvo certo');
+assert.strictEqual(alvoErrado({}), false, 'backend antigo: nao inventa aviso');
+assert.strictEqual(alvoErrado(null), false);
+
+console.log('OK  app.js: taxaDown, escapando, orfao, udpCego e alvoErrado (20 casos)');

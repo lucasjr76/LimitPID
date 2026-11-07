@@ -50,7 +50,7 @@ electron.js ──> server.js ──> backend/limitpid.js ──sudo──> limi
 | `/usr/local/libexec/limitpid/limitpid-loader` | loader libbpf | sim — recompila por `LOADER_API` |
 | `/usr/local/libexec/limitpid/limitpid.bpf.o` | objeto eBPF | sim — recompila por `BPF_API` |
 
-Backup do Python extraído: `backend/limitpid-net-v0.6.10.py` (só referência; o backend é a fonte).
+Backup do Python extraído: `backend/limitpid-net-v0.7.0.py` (só referência; o backend é a fonte).
 
 ---
 
@@ -244,6 +244,28 @@ motivos empilhados — nome `AppRun`, `UDP 0`, taxa `0.00 bps` afundando na orde
 **Antes de concluir que "o processo não aparece", procure pelo PID na lista** — pode estar
 lá com outro nome. Diagnóstico: `ss -uanpH | grep pid=<PID>` mostra os sockets UDP.
 
+### O carimbo do socket pode estar em QUALQUER cgroup (v0.7.0)
+Aconteceu três vezes: `ollama pull`, cópia SCP, `llama-server` baixando GGUF. O usuário
+limita um PID, o LimitPID move o processo, e o socket continua carimbado onde nasceu —
+no escopo do terminal, no `session-N.scope`, no `sshd.service`. Contadores do limitador
+ficam em **zero** e parece que o produto não funciona.
+
+**Diagnóstico em uma linha:**
+```bash
+ss -tanpH --cgroup | grep "pid=<PID>," | grep -oP 'cgroup:\K\S+'
+```
+
+O `apply` faz isso sozinho agora (`sockets_cgroup()`, 35 ms) e imprime o comando pronto.
+A checagem é **incondicional**: a primeira versão só rodava quando o cgroup não era
+reaproveitado, e o caso real do `llama-server` caiu exatamente nesse buraco.
+
+`cgroup-path` mira qualquer cgroup, com as mesmas três camadas de validação. Medido ao
+vivo: teto 80 → passou 82; teto 20 → passou 18 e 20.
+
+**bpffs recusa `.` em nome de diretório** (EPERM, medido; 99 caracteres passam). Por isso
+o slug do modo `path` troca ponto por `_`. E `cmd_cgroup` já prefixa o pin com `cg-` — o
+slug não deve prefixar de novo, ou o pin vira `cg-cg-…` e o `raw-stats` lê o lugar errado.
+
 ### Armadilha cliente/servidor
 `ollama pull` no host é só um **cliente** falando por loopback com o servidor no
 container. Limitar o PID do host **não faz nada** — o download é do container.
@@ -269,6 +291,13 @@ sudo limitpid containers                     # lista + estado (ativo/MORTO/sem l
 sudo limitpid cgroup NOME DOWN UP
 sudo limitpid cgroup-change NOME DOWN UP
 sudo limitpid cgroup-remove NOME
+```
+
+### Por cgroup arbitrário (v0.7.0+) — o alvo que o `apply` indica
+```bash
+sudo limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 20M 10M
+sudo limitpid cgroup-path-change <caminho> 80M 20M
+sudo limitpid cgroup-path-remove <caminho>
 ```
 
 ### Por serviço do systemd (v0.6.7+)

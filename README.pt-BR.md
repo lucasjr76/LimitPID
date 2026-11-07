@@ -147,7 +147,7 @@ cd LimitPID
 O backend é um único arquivo. **Instale a versão mais recente**, não uma cópia editada:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.10 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.7.0 /usr/local/sbin/limitpid
 ```
 
 Confirme:
@@ -218,11 +218,11 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.10 x 0.6.10
-OK  Marcador net-helper.api: 2-0.6.10 (esperado 2-0.6.10)
-OK  Copia do helper Python: limitpid-net-v0.6.10.py
+OK  VERSION bash x python embutido: 0.7.0 x 0.7.0
+OK  Marcador net-helper.api: 2-0.7.0 (esperado 2-0.7.0)
+OK  Copia do helper Python: limitpid-net-v0.7.0.py
 OK  app.css em dia com app.source.css
-OK  app.js: taxaDown, escapando, orfao e udpCego (16 casos)
+OK  app.js: taxaDown, escapando, orfao, udpCego e alvoErrado (20 casos)
 ```
 
 ### Passo 6 — rodar
@@ -440,6 +440,30 @@ separador de caminho são recusados, e a resolução nunca sai de `system.slice`
 `.service` é acrescentado se você omitir.
 
 Vale para qualquer unit — `pacman`, `snapd`, um daemon de backup.
+
+---
+
+## Uso — um cgroup pelo caminho
+
+Quando o limite num PID não morde, quase sempre é porque os sockets do processo foram
+carimbados em outro cgroup. O `apply` detecta e imprime o comando exato:
+
+```
+AVISO: os sockets deste PID NÃO estão neste cgroup, e sim em:
+AVISO:     /user.slice/.../kitty-3132500-0.scope
+AVISO:     limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 80M 20M
+```
+
+```bash
+sudo limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 20M 10M
+sudo limitpid cgroup-path-change <caminho> 80M 20M
+sudo limitpid cgroup-path-remove <caminho>
+```
+
+Nada é movido. O caminho é resolvido com `readlink -f`, precisa ficar dentro de
+`/sys/fs/cgroup`, e a raiz do cgroup é recusada.
+
+Para descobrir sozinho: `ss -tanpH --cgroup | grep "pid=<PID>,"`.
 
 ---
 
@@ -736,10 +760,10 @@ sozinhos.
 ## Estrutura do repositório
 
 ```
-limitpid-v0.6.10               backend (Bash + C + eBPF + Python embutidos)
+limitpid-v0.7.0               backend (Bash + C + eBPF + Python embutidos)
 backend/versions/             versões anteriores do backend (rollback)
 backend/limitpid.js           ponte Node → helper
-backend/limitpid-net-v0.6.10.py   cópia do helper Python extraído (backup/referência)
+backend/limitpid-net-v0.7.0.py   cópia do helper Python extraído (backup/referência)
 scripts/limitpid-gui-helper   ponte sudo, valida cada argumento
 scripts/install-helper.sh     instala o helper e a regra de sudoers
 scripts/uninstall-helper.sh   remove os dois

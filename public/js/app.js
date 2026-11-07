@@ -66,10 +66,18 @@ function orfao(l){ return num(l?.orphan_at_apply)>0; }
 // Processo sem limitador com socket UDP e taxa TCP zerada: a taxa dele NAO e
 // medida (so ha contador por socket para TCP). Mostrar "0.00 bps" ai era mentira
 // -- o Ghost Downloader baixava 19 Mbit/s por UDP e aparecia como ocioso.
+// O limitador existe, mas os sockets do processo foram carimbados em OUTRO
+// cgroup -- entao ele nao alcanca nada. Aconteceu com ollama, SCP e
+// llama-server. O backend descobre o alvo certo e grava em sockets_cgroup.
+function alvoErrado(l){ return !!(l && l.sockets_cgroup); }
 function udpCego(p){ return !p.limiter && num(p.udp)>0 && !(num(p.rate?.down_bps)>0); }
 function celulasVolateis(p){
   const l=p.limiter,d=num(l?.rate?.down_bps),u=num(l?.rate?.up_bps),
         util=Math.min(100,Math.max(0,num(l?.rate?.down_util_percent)));
+  if(alvoErrado(l))return{
+    conns:`<span class="badge">${p.total_connections} · TCP ${p.tcp} / UDP ${p.udp}</span>`,
+    down:bits(d),up:bits(u),
+    util:`<span class="badge tun" title="Os sockets deste processo nasceram em ${esc(l.sockets_cgroup)} e carregam esse carimbo. Este limite está anexado a outro cgroup e não os alcança. Rode: sudo limitpid cgroup-path ${esc(l.sockets_cgroup)} ${esc(l.limit_down||'')} ${esc(l.limit_up||'')}">limite no cgroup errado</span>`};
   if(udpCego(p))return{
     conns:`<span class="badge">${p.total_connections} · TCP ${p.tcp} / UDP ${p.udp}</span>`,
     down:'?',up:'?',

@@ -18,6 +18,10 @@ valid_name(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; }
 # ".." recusado a parte -- o regex ja barra barra, e o backend so resolve
 # dentro de system.slice. Tres barreiras, como no modo container.
 valid_unit(){ [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$ && "${1:-}" != *..* ]]; }
+# Caminho de cgroup: barra e legitima aqui, ".." nunca. O backend ainda resolve
+# com readlink -f e recusa qualquer coisa fora de /sys/fs/cgroup -- esta e a
+# primeira das tres barreiras, nao a unica.
+valid_cgpath(){ [[ "${1:-}" =~ ^/[A-Za-z0-9][A-Za-z0-9_./@-]{0,255}$ && "${1:-}" != *..* && "${1:-}" != *//* ]]; }
 cmd="${1:-}"; shift || true
 case "$cmd" in
   health) [[ $# -eq 0 ]]||die "argumentos invalidos"; printf '{"mode":"real","privileged":true}\n' ;;
@@ -32,5 +36,8 @@ case "$cmd" in
   service) [[ $# -eq 3 ]]||die "uso: service UNIT DOWN UP"; valid_unit "$1"||die "nome de servico invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" service "$1" "$2" "$3" ;;
   service-change) [[ $# -eq 3 ]]||die "uso: service-change UNIT DOWN UP"; valid_unit "$1"||die "nome de servico invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" service-change "$1" "$2" "$3" ;;
   service-remove) [[ $# -eq 1 ]]||die "uso: service-remove UNIT"; valid_unit "$1"||die "nome de servico invalido"; exec "$LIMITPID" service-remove "$1" ;;
+  cgroup-path) [[ $# -eq 3 ]]||die "uso: cgroup-path CAMINHO DOWN UP"; valid_cgpath "$1"||die "caminho de cgroup invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup-path "$1" "$2" "$3" ;;
+  cgroup-path-change) [[ $# -eq 3 ]]||die "uso: cgroup-path-change CAMINHO DOWN UP"; valid_cgpath "$1"||die "caminho de cgroup invalido"; valid_rate "$2"||die "download invalido"; valid_rate "$3"||die "upload invalido"; exec "$LIMITPID" cgroup-path-change "$1" "$2" "$3" ;;
+  cgroup-path-remove) [[ $# -eq 1 ]]||die "uso: cgroup-path-remove CAMINHO"; valid_cgpath "$1"||die "caminho de cgroup invalido"; exec "$LIMITPID" cgroup-path-remove "$1" ;;
   *) die "operacao nao permitida: ${cmd:-vazia}" ;;
 esac

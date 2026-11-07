@@ -8,6 +8,60 @@ A numeração é a do **backend** (`limitpid-vX.Y.Z`); a GUI acompanha.
 
 ---
 
+## [0.7.0] — 2026-11-07
+
+### Adicionado — o `apply` agora diz QUAL cgroup limitar
+Três vezes o autor limitou um PID e o tráfego passou por fora: `ollama pull`, uma cópia
+SCP e um `llama-server` baixando GGUF. Sempre a mesma física — o socket é carimbado no
+cgroup em que **nasceu**, e mover o processo não move o carimbo. O aviso antigo só dizia
+*"N conexões escapam"*, sem dizer para onde mirar.
+
+Agora o `apply` consulta `ss --cgroup` (35 ms) e, quando o carimbo não é o cgroup do
+limitador, imprime o comando pronto:
+
+```
+AVISO: os sockets deste PID NÃO estão neste cgroup, e sim em:
+AVISO:     /user.slice/.../kitty-3132500-0.scope
+AVISO: este limite não vai alcançá-los. Para limitar o que já está em andamento:
+AVISO:     limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 80M 20M
+```
+
+Grava em `$state/sockets_cgroup`, expõe como `sockets_cgroup` no snapshot, e a GUI mostra
+o badge **limite no cgroup errado** com o comando no `title`.
+
+A checagem é **incondicional** — a primeira versão só rodava quando o cgroup não era
+reaproveitado, e no caso real do `llama-server` o reuso pulava justamente o aviso.
+
+### Adicionado — `cgroup-path`, mirar um cgroup arbitrário
+```bash
+sudo limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 20M 10M
+sudo limitpid cgroup-path-change <caminho> 80M 20M
+sudo limitpid cgroup-path-remove <caminho>
+```
+
+O modo serviço só resolvia `system.slice/*.service`, mas o carimbo costuma estar num
+**escopo de usuário**. Medido no download do GGUF, ao vivo:
+
+| teto | passou |
+|---|---|
+| 80 Mbit/s | 82 |
+| 20 Mbit/s | 18 e 20 |
+
+Com descarte ativo e nenhum processo movido.
+
+**Segurança:** as mesmas três camadas. `valid_cgpath()` no helper (barra é legítima,
+`..` e `//` nunca), e `resolve_path_cgroup()` no backend, que resolve com `readlink -f`,
+recusa qualquer coisa fora de `/sys/fs/cgroup` e recusa a própria raiz. Testado contra
+`../../etc`, `/../etc`, `/`, `/system.slice/../../root`, `/a//b` e caminho sem barra —
+recusados nas duas camadas.
+
+### Armadilha encontrada
+- **bpffs recusa `.` em nome de diretório** (EPERM — medido; comprimento de 99 caracteres
+  passa sem problema). Caminho de cgroup é cheio de `.slice`/`.scope`, então o slug do
+  modo `path` troca ponto por `_`. Container e serviço mantêm o nome legível.
+
+---
+
 ## [0.6.10] — 2026-09-18
 
 ### Corrigido — processo consumindo banda e "invisível" na lista

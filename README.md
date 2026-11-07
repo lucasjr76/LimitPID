@@ -149,7 +149,7 @@ cd LimitPID
 The backend is a single file. **Install the newest version**, never an edited copy:
 
 ```bash
-sudo install -m 755 limitpid-v0.6.10 /usr/local/sbin/limitpid
+sudo install -m 755 limitpid-v0.7.0 /usr/local/sbin/limitpid
 ```
 
 Confirm:
@@ -221,11 +221,11 @@ OK  LimitPID: /usr/local/sbin/limitpid
 OK  Helper: /usr/local/libexec/limitpid/limitpid-gui-helper
 OK  Electron fixado em 43.2.0 (bandeja): 43.2.0
 OK  Dependencias fixadas: express@5.2.1, ws@8.21.3
-OK  VERSION bash x python embutido: 0.6.10 x 0.6.10
-OK  Marcador net-helper.api: 2-0.6.10 (esperado 2-0.6.10)
-OK  Copia do helper Python: limitpid-net-v0.6.10.py
+OK  VERSION bash x python embutido: 0.7.0 x 0.7.0
+OK  Marcador net-helper.api: 2-0.7.0 (esperado 2-0.7.0)
+OK  Copia do helper Python: limitpid-net-v0.7.0.py
 OK  app.css em dia com app.source.css
-OK  app.js: taxaDown, escapando, orfao e udpCego (16 casos)
+OK  app.js: taxaDown, escapando, orfao, udpCego e alvoErrado (20 casos)
 ```
 
 ### Step 6 — run it
@@ -447,6 +447,30 @@ path separator are rejected, and resolution never leaves `system.slice`. `.servi
 appended if you omit it.
 
 Works for any unit — `pacman`, `snapd`, a backup daemon.
+
+---
+
+## Usage — a cgroup by path
+
+When a limit on a PID does not bite, it is almost always because the process's sockets
+were stamped in a different cgroup. `apply` detects that and prints the exact command:
+
+```
+AVISO: os sockets deste PID NÃO estão neste cgroup, e sim em:
+AVISO:     /user.slice/.../kitty-3132500-0.scope
+AVISO:     limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 80M 20M
+```
+
+```bash
+sudo limitpid cgroup-path /user.slice/.../kitty-3132500-0.scope 20M 10M
+sudo limitpid cgroup-path-change <path> 80M 20M
+sudo limitpid cgroup-path-remove <path>
+```
+
+Nothing is moved. The path is resolved with `readlink -f`, must stay inside
+`/sys/fs/cgroup`, and the cgroup root itself is refused.
+
+To find it yourself: `ss -tanpH --cgroup | grep "pid=<PID>,"`.
 
 ---
 
@@ -746,10 +770,10 @@ at the next reboot.
 ## Repository layout
 
 ```
-limitpid-v0.6.10               backend (Bash + C + eBPF + embedded Python)
+limitpid-v0.7.0               backend (Bash + C + eBPF + embedded Python)
 backend/versions/             previous backend versions (rollback)
 backend/limitpid.js           Node → helper bridge
-backend/limitpid-net-v0.6.10.py   copy of the extracted Python helper (backup/reference)
+backend/limitpid-net-v0.7.0.py   copy of the extracted Python helper (backup/reference)
 scripts/limitpid-gui-helper   sudo bridge, validates every argument
 scripts/install-helper.sh     installs the helper and the sudoers rule
 scripts/uninstall-helper.sh   removes both
